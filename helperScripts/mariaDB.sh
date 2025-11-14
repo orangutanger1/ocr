@@ -10,8 +10,16 @@ fi
 MARIADB_CONFIG="/etc/mysql/mariadb.conf.d/50-server.cnf"
 AUTHORIZED_USERS_FILE="authorizedusers.txt"
 AUTHORIZED_SUDO_USERS_FILE="authorizedsudousers.txt"
-MARIADB_ROOT_PASSWORD="GbgH8vV0s%B6A3Tu"  # Change this to a secure password
-MARIADB_USER_PASSWORD="GbgH8vV0s%B6A3Tu"  # Change this to a secure password
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/password_utils.sh"
+MARIADB_ROOT_PASSWORD="$(generate_service_password)"
+MARIADB_USER_PASSWORD="$(generate_service_password)"
+MARIADB_CREDENTIALS=(-u root "-p${MARIADB_ROOT_PASSWORD}")
+
+run_mariadb_cmd() {
+  local query="$1"
+  mysql "${MARIADB_CREDENTIALS[@]}" -e "$query"
+}
 
 # Install MariaDB if not already installed
 if ! command -v mariadb &> /dev/null; then
@@ -32,6 +40,7 @@ y
 y
 y
 EOF
+store_service_password "mariadb_root" "$MARIADB_ROOT_PASSWORD"
 
 # Backup the current MariaDB configuration
 cp $MARIADB_CONFIG $MARIADB_CONFIG.bak
@@ -93,7 +102,7 @@ echo "Backup policy should be implemented manually."
 openssl req -x509 -newkey rsa:2048 -keyout /etc/mysql/server-key.pem -out /etc/mysql/server-cert.pem -days 365 -nodes -subj "/CN=MariaDB Server"
 
 # 2.6 Ensure 'password_lifetime' is Less Than or Equal to '365' (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "SET GLOBAL default_password_lifetime=365;"
+run_mariadb_cmd "SET GLOBAL default_password_lifetime=365;"
 
 # 2.7 Lock Out Accounts if Not Currently in Use (Manual)
 # Lock unused accounts manually
@@ -159,7 +168,7 @@ apt-get update
 apt-get upgrade -y mariadb-server
 
 # 4.2 Ensure Example or Test Databases are Not Installed on Production Servers (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "DROP DATABASE IF EXISTS test;"
+run_mariadb_cmd "DROP DATABASE IF EXISTS test;"
 
 # 4.3 Ensure 'allow-suspicious-udfs' is Set to 'OFF' (Automated)
 sed -i 's/^allow-suspicious-udfs.*/allow-suspicious-udfs = OFF/' $MARIADB_CONFIG
@@ -192,28 +201,28 @@ echo "innodb_encrypt_tables = ON" >> $MARIADB_CONFIG
 # Revoke unnecessary privileges from non-administrative users
 
 # 5.2 Ensure 'FILE' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE FILE ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE FILE ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.3 Ensure 'PROCESS' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE PROCESS ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE PROCESS ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.4 Ensure 'SUPER' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE SUPER ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE SUPER ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.5 Ensure 'SHUTDOWN' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE SHUTDOWN ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE SHUTDOWN ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.6 Ensure 'CREATE USER' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE CREATE USER ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE CREATE USER ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.7 Ensure 'GRANT OPTION' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE GRANT OPTION ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE GRANT OPTION ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.8 Ensure 'REPLICATION SLAVE' is Not Granted to Non-Administrative Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE REPLICATION SLAVE ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE REPLICATION SLAVE ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.9 Ensure DML/DDL Grants are Limited to Specific Databases and Users (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER ON *.* FROM 'nonadmin'@'localhost';"
+run_mariadb_cmd "REVOKE SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER ON *.* FROM 'nonadmin'@'localhost';"
 
 # 5.10 Securely Define Stored Procedures and Functions DEFINER and INVOKER (Manual)
 # Ensure stored procedures and functions are securely defined
@@ -239,16 +248,16 @@ echo "server_audit=FORCE_PLUS_PERMANENT" >> $MARIADB_CONFIG
 echo "encrypt_binlog=ON" >> $MARIADB_CONFIG
 
 # 7.1 Disable use of the mysql_old_password plugin (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "SET GLOBAL old_passwords=0;"
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "SET GLOBAL secure_auth=ON;"
+run_mariadb_cmd "SET GLOBAL old_passwords=0;"
+run_mariadb_cmd "SET GLOBAL secure_auth=ON;"
 
 # 7.2 Ensure Passwords are Not Stored in the Global Configuration (Automated)
 # Ensure passwords are not stored in the global configuration
 
 # 7.3 Ensure strong authentication is utilized for all accounts (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket;"
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "SET PASSWORD FOR 'mysql'@'localhost' = 'invalid';"
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "SET PASSWORD FOR 'mariadb.sys'@'localhost' = 'invalid';"
+run_mariadb_cmd "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket;"
+run_mariadb_cmd "SET PASSWORD FOR 'mysql'@'localhost' = 'invalid';"
+run_mariadb_cmd "SET PASSWORD FOR 'mariadb.sys'@'localhost' = 'invalid';"
 
 # 7.4 Ensure Password Complexity Policies are in Place (Automated)
 echo "plugin_load_add = simple_password_check" >> $MARIADB_CONFIG
@@ -259,10 +268,10 @@ echo "cracklib_password_check = FORCE_PLUS_PERMANENT" >> $MARIADB_CONFIG
 echo "strict_password_validation = ON" >> $MARIADB_CONFIG
 
 # 7.5 Ensure No Users Have Wildcard Hostnames (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "DELETE FROM mysql.user WHERE host = '%';"
+run_mariadb_cmd "DELETE FROM mysql.user WHERE host = '%';"
 
 # 7.6 Ensure No Anonymous Accounts Exist (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "DELETE FROM mysql.user WHERE user = '';"
+run_mariadb_cmd "DELETE FROM mysql.user WHERE user = '';"
 
 # 7.7 Prevent Password Reuse (Manual)
 echo "plugin_load_add = password_reuse_check" >> $MARIADB_CONFIG
@@ -274,7 +283,7 @@ sed -i 's/^require_secure_transport.*/require_secure_transport = ON/' $MARIADB_C
 sed -i 's/^have_ssl.*/have_ssl = YES/' $MARIADB_CONFIG
 
 # 8.2 Ensure 'ssl_type' is Set to 'ANY', 'X509', or 'SPECIFIED' for All Remote Users (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "ALTER USER 'remoteuser'@'%' REQUIRE SSL;"
+run_mariadb_cmd "ALTER USER 'remoteuser'@'%' REQUIRE SSL;"
 
 # 8.3 Set Maximum Connection Limits for Server and per User (Manual)
 sed -i 's/^max_connections.*/max_connections = 100/' $MARIADB_CONFIG
@@ -284,16 +293,16 @@ sed -i 's/^max_user_connections.*/max_user_connections = 10/' $MARIADB_CONFIG
 # Ensure replication traffic is secured using SSL/TLS
 
 # 9.2 Ensure 'MASTER_SSL_VERIFY_SERVER_CERT' is enabled (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_SSL_VERIFY_SERVER_CERT=1;"
+run_mariadb_cmd "CHANGE MASTER TO MASTER_SSL_VERIFY_SERVER_CERT=1;"
 
 # 9.3 Ensure 'super_priv' is Not Set to 'Y' for Replication Users (Automated)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "REVOKE SUPER ON *.* FROM 'repl'@'%';"
+run_mariadb_cmd "REVOKE SUPER ON *.* FROM 'repl'@'%';"
 
 # 9.4 Ensure only approved ciphers are used for Replication (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_SSL_CIPHER='ECDHE-ECDSA-AES128-GCM-SHA256';"
+run_mariadb_cmd "CHANGE MASTER TO MASTER_SSL_CIPHER='ECDHE-ECDSA-AES128-GCM-SHA256';"
 
 # 9.5 Ensure mutual TLS is enabled (Manual)
-mysql -u root -p$MARIADB_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_SSL_CERT='/etc/mysql/server-cert.pem', MASTER_SSL_KEY='/etc/mysql/server-key.pem';"
+run_mariadb_cmd "CHANGE MASTER TO MASTER_SSL_CERT='/etc/mysql/server-cert.pem', MASTER_SSL_KEY='/etc/mysql/server-key.pem';"
 
 # Restart MariaDB to apply changes
 systemctl restart mariadb

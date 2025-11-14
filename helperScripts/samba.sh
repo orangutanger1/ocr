@@ -1,5 +1,10 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/password_utils.sh"
+AUTHORIZED_USERS_FILE="$SCRIPT_DIR/authorizedusers.txt"
+AUTHORIZED_SUDO_USERS_FILE="$SCRIPT_DIR/authorizedsudousers.txt"
+
 set -e
 
 apt-get update
@@ -99,9 +104,11 @@ aio write size = 1
     vfs objects = full_audit
 EOL
 
-cat > setup_samba_users.sh <<'EOL'
-#!/bin/bash
-set -e
+echo "local5.*  /var/log/samba/audit.log" > /etc/rsyslog.d/samba.conf
+systemctl restart rsyslog
+mkdir -p /var/log/samba
+chmod 700 /var/log/samba
+
 groupadd -f smbgroup
 groupadd -f smbadmin
 
@@ -109,23 +116,37 @@ chown root:smbgroup /samba/public
 chown root:smbadmin /samba/private
 chown root:smbadmin /samba/admin
 
-while IFS= read -r user; do
-    if ! id "$user" >/dev/null 2>&1; then
-        useradd -m -s /sbin/nologin "$user"
-    fi
-    echo -e "${user}_password\n${user}_password" | smbpasswd -a "$user"
-    smbpasswd -e "$user"
-    usermod -aG smbgroup "$user"
-done < authorizedusers.txt
+if [ -f "$AUTHORIZED_USERS_FILE" ]; then
+    while IFS= read -r user || [ -n "$user" ]; do
+        [ -z "$user" ] && continue
+        if ! id "$user" >/dev/null 2>&1; then
+            useradd -m -s /sbin/nologin "$user"
+        fi
+        user_password="$(generate_service_password)"
+        printf "%s\n%s\n" "$user_password" "$user_password" | smbpasswd -a "$user"
+        smbpasswd -e "$user"
+        usermod -aG smbgroup "$user"
+        store_service_password "samba:${user}" "$user_password"
+    done < "$AUTHORIZED_USERS_FILE"
+else
+    echo "No authorized users file found for Samba at $AUTHORIZED_USERS_FILE"
+fi
 
-while IFS= read -r admin; do
-    if ! id "$admin" >/dev/null 2>&1; then
-        useradd -m -s /sbin/nologin "$admin"
-    fi
-    echo -e "${admin}_password\n${admin}_password" | smbpasswd -a "$admin"
-    smbpasswd -e "$admin"
-    usermod -aG smbadmin "$admin"
-done < authorizedsudousers.txt
+if [ -f "$AUTHORIZED_SUDO_USERS_FILE" ]; then
+    while IFS= read -r admin || [ -n "$admin" ]; do
+        [ -z "$admin" ] && continue
+        if ! id "$admin" >/dev/null 2>&1; then
+            useradd -m -s /sbin/nologin "$admin"
+        fi
+        admin_password="$(generate_service_password)"
+        printf "%s\n%s\n" "$admin_password" "$admin_password" | smbpasswd -a "$admin"
+        smbpasswd -e "$admin"
+        usermod -aG smbadmin "$admin"
+        store_service_password "samba:${admin}" "$admin_password"
+    done < "$AUTHORIZED_SUDO_USERS_FILE"
+else
+    echo "No authorized sudo users file found for Samba at $AUTHORIZED_SUDO_USERS_FILE"
+fi
 
 if command -v semanage >/dev/null 2>&1; then
     semanage fcontext -a -t samba_share_t "/samba(/.*)?"
@@ -141,19 +162,8 @@ fi
 
 systemctl restart smbd
 systemctl enable smbd
-EOL
-
-chmod +x setup_samba_users.sh
-
-echo "local5.*  /var/log/samba/audit.log" > /etc/rsyslog.d/samba.conf
-systemctl restart rsyslog
-mkdir -p /var/log/samba
-chmod 700 /var/log/samba
 
 testparm -s
 systemctl enable smbd
 systemctl restart smbd
-
-./setup_samba_users.sh
-
 systemctl status smbd

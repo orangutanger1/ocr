@@ -4,8 +4,16 @@
 # This script installs MySQL (if not already installed) and secures it.
 
 # Variables
-MYSQL_ROOT_PASSWORD="Cyb3Rm0nk3y$"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/password_utils.sh"
+MYSQL_ROOT_PASSWORD="$(generate_service_password)"
 MYSQL_SECURE_INSTALLATION="/usr/bin/mysql_secure_installation"
+MYSQL_CREDENTIALS=(-u root "-p${MYSQL_ROOT_PASSWORD}")
+
+run_mysql_root() {
+  local query="$1"
+  mysql "${MYSQL_CREDENTIALS[@]}" -e "$query"
+}
 
 # Function to install MySQL
 install_mysql() {
@@ -54,6 +62,7 @@ expect "Reload privilege tables now?"
 send "Y\r"
 expect eof
 EOF
+store_service_password "mysql_root" "$MYSQL_ROOT_PASSWORD"
 
 # Additional Security Measures
 
@@ -68,23 +77,23 @@ sed -i 's/^bind-address\s*=\s*.*/bind-address = 127.0.0.1/' /etc/mysql/mysql.con
 
 # 3. Remove default MySQL test database
 echo "Removing default MySQL test database..."
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "DROP DATABASE IF EXISTS test;"
+run_mysql_root "DROP DATABASE IF EXISTS test;"
 
 # 4. Remove anonymous users (if any remain)
 echo "Removing anonymous users..."
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "DELETE FROM mysql.user WHERE User='';"
+run_mysql_root "DELETE FROM mysql.user WHERE User='';"
 
 # 5. Remove remote root login
 echo "Removing remote root login..."
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+run_mysql_root "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
 
 # 6. Flush privileges
 echo "Flushing privileges..."
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "FLUSH PRIVILEGES;"
+run_mysql_root "FLUSH PRIVILEGES;"
 
 # 7. Enable MySQL SSL (if applicable)
 echo "Enabling MySQL SSL..."
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "ALTER USER 'root'@'localhost' REQUIRE SSL;"
+run_mysql_root "ALTER USER 'root'@'localhost' REQUIRE SSL;"
 
 # 8. Restart MySQL service
 echo "Restarting MySQL service..."

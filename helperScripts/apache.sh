@@ -1,1108 +1,1108 @@
 #!/bin/bash
 
-# #############################################################################
-# Apache HTTP Server Hardening Script based on CIS Benchmark v2.2.0
-#
-# WARNING: This script modifies Apache configuration files.
-#          BACK UP YOUR CONFIGURATION BEFORE RUNNING.
-#          Review the script carefully and test in a non-production environment.
-#          Run this script as root or with sudo.
-#
-# Usage: sudo ./apache_harden_cis.sh
-# #############################################################################
+# CIS Apache HTTP Server 2.4 Benchmark Configuration Script
+# Version: 2.3.0
+# Date: 09-23-2025
+# Compatible with: Ubuntu and Linux Mint
 
-# --- Configuration ---
-BACKUP_DIR="/opt/apache_cis_backups_$(date +%Y%m%d_%H%M%S)"
-APACHE_CONF_DIR=""
-APACHE_CONF_FILE=""
-APACHE_SERVICE=""
-APACHE_USER=""
-APACHE_GROUP=""
-APACHE_DOC_ROOT="" # Will attempt to detect
-APACHE_MODULE_UTIL="" # a2enmod/a2dismod or manual
-APACHE_MODULE_DIR=""
-DISTRO=""
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# --- Helper Functions ---
-
-log_info() {
-    echo "[INFO] $1"
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-log_warn() {
-    echo "[WARN] $1"
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-log_error() {
-    echo "[ERROR] $1" >&2
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-check_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        log_error "This script must be run as root or with sudo."
-        exit 1
-    fi
-}
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   print_error "This script must be run as root"
+   exit 1
+fi
 
-detect_distro() {
-    if [ -f /etc/os-release ]; then
-        # shellcheck source=/dev/null
-        source /etc/os-release
-        ID_LIKE=${ID_LIKE:-$ID} # Use ID if ID_LIKE is not set
-        if [[ "$ID" == "ubuntu" || "$ID" == "debian" || "$ID_LIKE" == "debian" ]]; then
-            DISTRO="debian"
-            APACHE_CONF_DIR="/etc/apache2"
-            APACHE_CONF_FILE="/etc/apache2/apache2.conf"
-            APACHE_SERVICE="apache2"
-            APACHE_USER="www-data"
-            APACHE_GROUP="www-data"
-            APACHE_MODULE_UTIL="a2" # Indicates a2enmod/a2dismod
-            APACHE_MODULE_DIR="/etc/apache2/mods-available"
-            log_info "Detected Debian/Ubuntu distribution."
-        elif [[ "$ID" == "centos" || "$ID" == "rhel" || "$ID" == "fedora" || "$ID" == "rocky" || "$ID" == "almalinux" || "$ID_LIKE" == *"fedora"* ]]; then
-            DISTRO="rhel"
-            APACHE_CONF_DIR="/etc/httpd"
-            APACHE_CONF_FILE="/etc/httpd/conf/httpd.conf"
-            APACHE_SERVICE="httpd"
-            APACHE_USER="apache"
-            APACHE_GROUP="apache"
-            APACHE_MODULE_UTIL="manual" # Indicates manual LoadModule editing
-            APACHE_MODULE_DIR="/etc/httpd/conf.modules.d"
-            log_info "Detected RHEL/CentOS/Fedora distribution."
-        else
-            log_error "Unsupported distribution: $ID"
-            exit 1
-        fi
-    else
-        log_error "/etc/os-release not found. Cannot detect distribution."
-        exit 1
-    fi
+# Detect distribution
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO=$ID
+else
+    print_error "Cannot detect distribution"
+    exit 1
+fi
 
-    # Attempt to detect DocumentRoot (basic guess)
-    APACHE_DOC_ROOT=$(grep -i '^\s*DocumentRoot' "$APACHE_CONF_DIR"/*conf* "$APACHE_CONF_DIR"/sites-enabled/* "$APACHE_CONF_DIR"/conf.d/* 2>/dev/null | sed -n 's/^[ \t]*DocumentRoot[ \t]*"\?\([^"]*\)"\?/\1/p' | tail -n 1)
-    if [[ -z "$APACHE_DOC_ROOT" ]]; then
-        if [[ "$DISTRO" == "debian" ]]; then APACHE_DOC_ROOT="/var/www/html"; fi
-        if [[ "$DISTRO" == "rhel" ]]; then APACHE_DOC_ROOT="/var/www/html"; fi
-        log_warn "Could not reliably detect DocumentRoot, assuming $APACHE_DOC_ROOT"
-    else
-        log_info "Detected DocumentRoot: $APACHE_DOC_ROOT"
-    fi
+if [[ "$DISTRO" != "ubuntu" && "$DISTRO" != "linuxmint" ]]; then
+    print_error "This script is designed for Ubuntu and Linux Mint only"
+    exit 1
+fi
 
-    # Ensure critical variables are set
-     if [[ -z "$APACHE_CONF_DIR" || -z "$APACHE_CONF_FILE" || -z "$APACHE_SERVICE" || -z "$APACHE_USER" || -z "$APACHE_GROUP" ]]; then
-         log_error "Critical Apache configuration variables could not be determined."
-         exit 1
-     fi
-}
+print_status "Detected distribution: $DISTRO"
 
-backup_config() {
-    local file_to_backup="$1"
-    if [[ ! -f "$file_to_backup" ]]; then
-        log_warn "File not found, skipping backup: $file_to_backup"
-        return
-    fi
-    local backup_path="$BACKUP_DIR$(dirname "$file_to_backup")"
-    mkdir -p "$backup_path"
-    cp -a "$file_to_backup" "$backup_path/"
-    log_info "Backed up $file_to_backup to $backup_path/"
-}
+# Update package lists
+print_status "Updating package lists..."
+apt-get update
 
-# Finds relevant config files (main + includes)
-get_config_files() {
-    find "$APACHE_CONF_DIR" -type f \( -name "*.conf" -o -name ".htaccess" \) -print0 | xargs -0 grep -l ""
-    # This is a basic find, might need refinement for complex include structures
-}
+# Install Apache2 if not already installed
+if ! command -v apache2 &> /dev/null; then
+    print_status "Installing Apache2..."
+    apt-get install -y apache2 apache2-utils
+else
+    print_status "Apache2 is already installed"
+fi
 
-# Add or modify a directive in a specific file
-# Usage: set_directive "DirectiveName" "DirectiveValue" "ConfigFile" ["ScopeRegex"]
-# ScopeRegex is optional, used to add within a specific block like <Directory />
-set_directive() {
-    local directive="$1"
-    local value="$2"
-    local config_file="$3"
-    local scope_regex="${4:-}"
-    local full_directive="$directive $value"
+# Define paths based on distribution
+if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "linuxmint" ]]; then
+    APACHE_CONF_DIR="/etc/apache2"
+    APACHE_CONF="$APACHE_CONF_DIR/apache2.conf"
+    SITES_AVAILABLE="$APACHE_CONF_DIR/sites-available"
+    SITES_ENABLED="$APACHE_CONF_DIR/sites-enabled"
+    MODS_AVAILABLE="$APACHE_CONF_DIR/mods-available"
+    MODS_ENABLED="$APACHE_CONF_DIR/mods-enabled"
+    CONF_AVAILABLE="$APACHE_CONF_DIR/conf-available"
+    CONF_ENABLED="$APACHE_CONF_DIR/conf-enabled"
+    WWW_DIR="/var/www/html"
+    LOG_DIR="/var/log/apache2"
+    LOCK_FILE="/var/lock/apache2/accept.lock"
+    PID_FILE="/var/run/apache2/apache2.pid"
+    SCOREBOARD_FILE="/var/run/apache2/apache2.scoreboard"
+    USER="www-data"
+    GROUP="www-data"
+fi
 
-    if [[ ! -f "$config_file" ]]; then
-        log_warn "Config file not found for setting directive '$directive': $config_file"
-        return
-    fi
-
-    backup_config "$config_file"
-
-    # Check if directive exists with the correct value globally or within scope
-    if [[ -n "$scope_regex" ]]; then
-        # Complex scope checking is hard, this is a simplified check
-        # It doesn't guarantee placement *within* the block, just checks if the directive exists somewhere
-        if awk -v dir="$directive" -v val="$value" -v scope_start="$scope_regex" '
-            BEGIN { found_scope=0; found_directive=0 }
-            $0 ~ scope_start { found_scope=1 }
-            found_scope && $1 == dir {
-                line = $0; sub(/^[^ ]+ /, "", line);
-                if (line == val) { found_directive=1; exit 0 }
-            }
-            found_scope && $0 ~ /<\// { found_scope=0 } # Basic end scope detection
-            END { exit found_directive == 0 }
-        ' "$config_file"; then
-             log_info "'$directive $value' appears correctly set in/after scope '$scope_regex' in $config_file."
-             return
-        fi
-    elif grep -q "^\s*${directive}\s\+${value}\s*$" "$config_file"; then
-        log_info "'$directive $value' already correctly set in $config_file."
-        return
-    fi
-
-    # Check if directive exists with a different value and modify it
-    if grep -q "^\s*${directive}\s\+" "$config_file"; then
-        log_info "Modifying '$directive' to '$value' in $config_file."
-        # Use '#' as sed delimiter assuming paths don't contain it commonly
-        sed -i "s#^\s*${directive}\s\+.*#${full_directive}#" "$config_file"
-    else
-        # Add the directive
-        log_info "Adding '$directive $value' to $config_file."
-        if [[ -n "$scope_regex" ]]; then
-             # Attempt to add within scope - might need manual adjustment
-             log_warn "Attempting to add '$full_directive' within scope '$scope_regex'. Verify placement in $config_file."
-             sed -i "/${scope_regex}/a ${full_directive}" "$config_file"
-        else
-             # Add globally at the end (or choose a better location like security.conf if applicable)
-             echo "$full_directive" >> "$config_file"
-        fi
-    fi
-}
-
-# Comment out a directive
-# Usage: comment_directive "DirectiveRegex" "ConfigFile"
-comment_directive() {
-    local directive_regex="$1"
-    local config_file="$2"
-
-     if [[ ! -f "$config_file" ]]; then
-        log_warn "Config file not found for commenting directive matching '$directive_regex': $config_file"
-        return
-    fi
-
-    if grep -q "^\s*#\+\s*${directive_regex}" "$config_file"; then
-        log_info "Directive matching '$directive_regex' already commented out in $config_file."
-        return
-    fi
-
-    if grep -q "^\s*${directive_regex}" "$config_file"; then
-        backup_config "$config_file"
-        log_info "Commenting out directive matching '$directive_regex' in $config_file."
-        sed -i "s#^\(\s*\)\(${directive_regex}\)#\1# \2#" "$config_file"
-    else
-        log_info "Directive matching '$directive_regex' not found in $config_file."
-    fi
-}
-
-# Manage Apache modules
-# Usage: manage_module "module_name" "enable|disable"
-manage_module() {
-    local module_name="$1"
-    local action="$2" # "enable" or "disable"
-    local module_file_name="mod_${module_name}.so"
-    local loadmodule_line="LoadModule ${module_name}_module" # Regex part
-
-    if [[ "$APACHE_MODULE_UTIL" == "a2" ]]; then
-        # Debian/Ubuntu using a2enmod/a2dismod
-        if [[ "$action" == "enable" ]]; then
-            if [[ -L "$APACHE_CONF_DIR/mods-enabled/${module_name}.load" ]]; then
-                 log_info "Module '$module_name' already enabled."
-            else
-                 if [[ -f "$APACHE_CONF_DIR/mods-available/${module_name}.load" ]]; then
-                    log_info "Enabling module '$module_name'."
-                    a2enmod "$module_name" || log_error "Failed to enable module '$module_name'."
-                 else
-                    log_warn "Module '$module_name' not available to enable."
-                 fi
-            fi
-        elif [[ "$action" == "disable" ]]; then
-             if [[ ! -L "$APACHE_CONF_DIR/mods-enabled/${module_name}.load" ]]; then
-                 log_info "Module '$module_name' already disabled."
-             else
-                 log_info "Disabling module '$module_name'."
-                 a2dismod "$module_name" || log_error "Failed to disable module '$module_name'."
-             fi
-        fi
-    else
-        # RHEL/Manual - Comment/Uncomment LoadModule lines
-        local found_in_files=()
-        # Check in main module dir and conf.d
-        while IFS= read -r -d $'\0' file; do
-            if grep -q "^\s*LoadModule\s\+${module_name}_module" "$file"; then
-                 found_in_files+=("$file")
-            fi
-        done < <(find "$APACHE_MODULE_DIR" "$APACHE_CONF_DIR/conf.d" -maxdepth 1 -name "*.conf" -print0 2>/dev/null)
-
-         if [[ ${#found_in_files[@]} -eq 0 ]]; then
-             if [[ "$action" == "enable" ]]; then
-                 log_warn "Could not find LoadModule line for '$module_name' to enable it. Manual check needed."
-             else
-                 log_info "Module '$module_name' not found (or already effectively disabled)."
-             fi
-             return
-         fi
-
-         for config_file in "${found_in_files[@]}"; do
-             backup_config "$config_file"
-             if [[ "$action" == "enable" ]]; then
-                 # Uncomment
-                 if grep -q "^\s*#\+\s*LoadModule\s\+${module_name}_module" "$config_file"; then
-                     log_info "Enabling (uncommenting) module '$module_name' in $config_file."
-                     sed -i "s#^\s*#\+\(\s*LoadModule\s\+${module_name}_module.*\)#\1#" "$config_file"
-                 else
-                     log_info "Module '$module_name' already enabled (uncommented) in $config_file."
-                 fi
-             elif [[ "$action" == "disable" ]]; then
-                 # Comment out
-                 if grep -q "^\s*LoadModule\s\+${module_name}_module" "$config_file"; then
-                      log_info "Disabling (commenting) module '$module_name' in $config_file."
-                      sed -i "s#^\(\s*LoadModule\s\+${module_name}_module.*\)## \1#" "$config_file"
-                 else
-                      log_info "Module '$module_name' already disabled (commented) in $config_file."
-                 fi
-             fi
-         done
-    fi
-}
-
-# Find and configure a block like <Directory /path> ... </Directory>
-# Usage: configure_block "<Directory /path>" "Directive" "Value"
-# NOTE: This is simplified. Adds directive *after* the opening tag. May not be ideal placement.
-configure_block() {
-    local block_start_regex="$1"
-    local directive="$2"
-    local value="$3"
-    local files_to_check
-
-    files_to_check=$(get_config_files)
-
-    local found_block=0
-    local file_containing_block=""
-
-    # Try to find the block
-    for f in $files_to_check; do
-        if grep -q "$block_start_regex" "$f"; then
-            file_containing_block="$f"
-            found_block=1
-            break
-        fi
-    done
-
-    if [[ $found_block -eq 0 ]]; then
-        log_warn "Could not find block '$block_start_regex'. Manual configuration needed for '$directive'."
-        # Optionally: Create the block in a default/security config file
-        # config_file="/etc/apache2/conf-available/security-cis.conf" or similar
-        # echo "$block_start_regex" >> "$config_file"
-        # echo "    $directive $value" >> "$config_file"
-        # echo "</${block_start_regex#<}>" >> "$config_file"
-        # manage_conf "security-cis" "enable" # If using conf-available
-        return
-    fi
-
-    backup_config "$file_containing_block"
-
-    # Check if directive exists with correct value within the block
-    if awk -v block_start="$block_start_regex" -v dir="$directive" -v val="$value" '
-        BEGIN { in_block=0; found_correct=0 }
-        $0 ~ block_start { in_block=1 }
-        in_block && $1 == dir {
-            line = $0; sub(/^[^ ]+ /, "", line);
-            if (line == val) { found_correct=1; exit 0 } # Exit awk successfully
-        }
-        in_block && $0 ~ /<\// { in_block=0 } # Basic end block detection
-        END { exit found_correct == 0 } # Exit awk with 1 if not found correct
-    ' "$file_containing_block"; then
-         log_info "'$directive $value' already correctly set in block '$block_start_regex' in $file_containing_block."
-    else
-         # Check if directive exists with different value and modify it (within block - complex with sed)
-         # Simplified: Check globally first, then attempt to add within block
-         if grep -q "^\s*${directive}\s\+" "$file_containing_block"; then
-             log_warn "Directive '$directive' exists globally or in another block in $file_containing_block. Attempting modification - review required."
-             sed -i "s#^\s*${directive}\s\+.*#    $directive $value#" "$file_containing_block" # Risky - might modify wrong instance
-         else
-             # Add directive after the block start line
-             log_info "Adding '$directive $value' to block '$block_start_regex' in $file_containing_block."
-             # Use awk for safer insertion after the block start line
-             awk -v block_start="$block_start_regex" -v new_line="    $directive $value" '
-             1; $0 ~ block_start { print new_line }
-             ' "$file_containing_block" > temp_$$ && mv temp_$$ "$file_containing_block"
-         fi
-    fi
-}
-
-# Manage Apache conf snippets (Debian/Ubuntu specific)
-# Usage: manage_conf "conf_name" "enable|disable"
-manage_conf() {
-     if [[ "$DISTRO" != "debian" ]]; then return; fi
-     local conf_name="$1"
-     local action="$2"
-
-     if [[ "$action" == "enable" ]]; then
-         if [[ -L "$APACHE_CONF_DIR/conf-enabled/${conf_name}.conf" ]]; then
-             log_info "Conf snippet '$conf_name' already enabled."
-         else
-             if [[ -f "$APACHE_CONF_DIR/conf-available/${conf_name}.conf" ]]; then
-                 log_info "Enabling conf snippet '$conf_name'."
-                 a2enconf "$conf_name" || log_error "Failed to enable conf '$conf_name'."
-             else
-                 log_warn "Conf snippet '$conf_name' not available to enable."
-             fi
-         fi
-     elif [[ "$action" == "disable" ]]; then
-         if [[ ! -L "$APACHE_CONF_DIR/conf-enabled/${conf_name}.conf" ]]; then
-             log_info "Conf snippet '$conf_name' already disabled."
-         else
-             log_info "Disabling conf snippet '$conf_name'."
-             a2disconf "$conf_name" || log_error "Failed to disable conf '$conf_name'."
-         fi
-     fi
-}
-
-# Find the primary config file for global settings or create one
-find_primary_config() {
-    if [[ "$DISTRO" == "debian" ]]; then
-        # Use a dedicated conf snippet for CIS settings
-        local cis_conf="/etc/apache2/conf-available/security-cis.conf"
-        if [[ ! -f "$cis_conf" ]]; then
-            log_info "Creating dedicated CIS config snippet: $cis_conf"
-            echo "# CIS Benchmark Hardening Settings" > "$cis_conf"
-            echo "# Managed by hardening script" >> "$cis_conf"
-        fi
-        manage_conf "security-cis" "enable"
-        echo "$cis_conf"
-    elif [[ "$DISTRO" == "rhel" ]]; then
-         # Use a file in conf.d
-         local cis_conf="/etc/httpd/conf.d/security-cis.conf"
-         if [[ ! -f "$cis_conf" ]]; then
-             log_info "Creating dedicated CIS config file: $cis_conf"
-             echo "# CIS Benchmark Hardening Settings" > "$cis_conf"
-             echo "# Managed by hardening script" >> "$cis_conf"
-         fi
-         echo "$cis_conf"
-    else
-        # Fallback to main config file
-        echo "$APACHE_CONF_FILE"
-    fi
-}
-
-# --- Main Script ---
-
-check_root
-detect_distro # Detect OS and set paths/variables
-
+# Create backup directory
+BACKUP_DIR="/root/apache2_backup_$(date +%Y%m%d%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-log_info "Configuration backups will be stored in $BACKUP_DIR"
+print_status "Created backup directory: $BACKUP_DIR"
 
-PRIMARY_CONF_FILE=$(find_primary_config)
-log_info "Primary configuration file for global settings: $PRIMARY_CONF_FILE"
+# Backup original configuration files
+print_status "Backing up original configuration files..."
+cp -r "$APACHE_CONF_DIR" "$BACKUP_DIR/"
 
-# --- Section 1: Planning and Installation (Manual) ---
-log_info "CIS 1.1: Ensure Pre-Installation Planning Checklist (Manual)"
-log_info "CIS 1.2: Ensure Server Is Not Multi-Use (Manual)"
-log_info "CIS 1.3: Ensure Apache Is Installed From Appropriate Binaries (Manual)"
+# 1. Planning and Installation
+print_status "Section 1: Planning and Installation"
 
-# --- Section 2: Minimize Apache Modules ---
-log_info "CIS Section 2: Minimizing Apache Modules"
-# 2.1 Manual - User must determine necessary auth modules
-log_info "CIS 2.1: Ensure Only Necessary Authentication/Authorization Modules (Manual Review Required)"
-log_warn "Review your authentication needs. Disabling common potentially unneeded modules below."
+# 1.1 Ensure the Pre-Installation Planning Checklist Has Been Implemented (Manual)
+print_status "1.1 Pre-Installation Planning Checklist"
+print_warning "Manual step: Review and implement the pre-installation planning checklist"
+print_warning "- Reviewed and implemented company's security policies"
+print_warning "- Implemented a secure network infrastructure"
+print_warning "- Harden the underlying Operating System"
+print_warning "- Implement central log monitoring processes"
+print_warning "- Implemented a disk space monitoring process and log rotation mechanism"
+print_warning "- Educate developers about secure applications"
+print_warning "- Ensure WHOIS Domain information does not reveal sensitive information"
+print_warning "- Ensure DNS servers are properly secured"
+print_warning "- Implemented a Network Intrusion Detection System"
 
-manage_module "authn_dbm" "disable"
-manage_module "authn_anon" "disable"
-manage_module "authn_dbd" "disable"
-manage_module "authn_socache" "disable" # Often needed by ssl, check usage
-manage_module "authz_dbm" "disable"
-manage_module "authz_owner" "disable"
-manage_module "authz_ldap" "disable" # If LDAP not used
-manage_module "authz_dbd" "disable"
+# 1.2 Ensure the Server Is Not a Multi-Use System (Manual)
+print_status "1.2 Ensure the Server Is Not a Multi-Use System"
+print_warning "Manual step: Review and disable unnecessary services"
+print_status "Listing enabled services..."
+systemctl list-unit-files --state enabled
 
-# 2.2 Ensure log_config is enabled (Usually built-in or enabled by default)
-log_info "CIS 2.2: Ensuring log_config module is effectively enabled (Usually core)"
-# manage_module "log_config" "enable" # Generally not needed to explicitly enable
+# 1.3 Ensure Apache Is Installed From the Appropriate Binaries (Manual)
+print_status "1.3 Ensure Apache Is Installed From the Appropriate Binaries"
+print_status "Apache2 is installed from the distribution's package repository"
 
-# 2.3 Disable WebDAV
-log_info "CIS 2.3: Disabling WebDAV modules"
-manage_module "dav" "disable"
-manage_module "dav_fs" "disable"
-manage_module "dav_lock" "disable"
+# 2. Minimize Apache Modules
+print_status "Section 2: Minimize Apache Modules"
 
-# 2.4 Disable Status module
-log_info "CIS 2.4: Disabling status module"
-manage_module "status" "disable"
+# 2.1 Ensure Only Necessary Authentication and Authorization Modules Are Enabled (Manual)
+print_status "2.1 Ensure Only Necessary Authentication and Authorization Modules Are Enabled"
+print_warning "Manual step: Review and disable unnecessary authentication and authorization modules"
+print_status "Currently loaded authentication and authorization modules:"
+apache2ctl -M | grep auth
 
-# 2.5 Disable Autoindex module
-log_info "CIS 2.5: Disabling autoindex module"
-manage_module "autoindex" "disable"
-
-# 2.6 Disable Proxy modules (if not used)
-log_info "CIS 2.6: Disabling proxy modules (Re-enable if Apache is used as a proxy)"
-manage_module "proxy" "disable"
-manage_module "proxy_http" "disable"
-manage_module "proxy_ftp" "disable"
-manage_module "proxy_connect" "disable"
-manage_module "proxy_ajp" "disable"
-manage_module "proxy_balancer" "disable"
-manage_module "proxy_express" "disable"
-manage_module "proxy_fcgi" "disable"
-manage_module "proxy_scgi" "disable"
-manage_module "proxy_wstunnel" "disable"
-manage_module "proxy_hcheck" "disable"
-
-# 2.7 Disable User Directories module
-log_info "CIS 2.7: Disabling userdir module"
-manage_module "userdir" "disable"
-
-# 2.8 Disable Info module
-log_info "CIS 2.8: Disabling info module"
-manage_module "info" "disable"
-
-# 2.9 Disable Basic/Digest Auth modules (Use alternative auth if needed)
-log_info "CIS 2.9: Disabling Basic and Digest authentication modules"
-manage_module "auth_basic" "disable"
-manage_module "auth_digest" "disable"
-
-# --- Section 3: Principles, Permissions, and Ownership ---
-log_info "CIS Section 3: Principles, Permissions, and Ownership"
-
-# 3.1 Check User/Group are not root
-log_info "CIS 3.1: Ensure Apache runs as non-root user"
-if grep -qi '^\s*User\s\+root' "$APACHE_CONF_FILE" $(get_config_files); then
-    log_error "Apache User directive is set to 'root'. This is insecure. Manually change to '$APACHE_USER' or similar."
+# 2.2 Ensure the Log Config Module Is Enabled (Automated)
+print_status "2.2 Ensure the Log Config Module Is Enabled"
+if apache2ctl -M | grep -q "log_config_module"; then
+    print_status "log_config_module is already enabled"
 else
-    log_info "Apache User directive appears non-root."
-    # Optionally ensure it's set to the expected user
-    # set_directive "User" "$APACHE_USER" "$APACHE_CONF_FILE"
-fi
-if grep -qi '^\s*Group\s\+root' "$APACHE_CONF_FILE" $(get_config_files); then
-     log_warn "Apache Group directive is set to 'root'. Consider changing to '$APACHE_GROUP'."
-else
-     log_info "Apache Group directive appears non-root."
-     # Optionally ensure it's set to the expected group
-     # set_directive "Group" "$APACHE_GROUP" "$APACHE_CONF_FILE"
+    print_status "Enabling log_config_module..."
+    a2enmod log_config
 fi
 
-# 3.2 Ensure Apache user has invalid shell
-log_info "CIS 3.2: Ensure Apache user account ($APACHE_USER) has invalid shell"
-apache_shell=$(grep "^${APACHE_USER}:" /etc/passwd | cut -d: -f7)
-invalid_shells=("/sbin/nologin" "/usr/sbin/nologin" "/bin/false")
-is_invalid=0
-for shell in "${invalid_shells[@]}"; do
-    if [[ "$apache_shell" == "$shell" ]]; then
-        is_invalid=1
-        break
+# 2.3 Ensure the WebDAV Modules Are Disabled (Automated)
+print_status "2.3 Ensure the WebDAV Modules Are Disabled"
+if apache2ctl -M | grep -q "dav_module"; then
+    print_status "Disabling dav_module..."
+    a2dismod dav
+    a2dismod dav_fs
+else
+    print_status "WebDAV modules are already disabled"
+fi
+
+# 2.4 Ensure the Status Module Is Disabled (Automated)
+print_status "2.4 Ensure the Status Module Is Disabled"
+if apache2ctl -M | grep -q "status_module"; then
+    print_status "Disabling status_module..."
+    a2dismod status
+else
+    print_status "status_module is already disabled"
+fi
+
+# 2.5 Ensure the Autoindex Module Is Disabled (Automated)
+print_status "2.5 Ensure the Autoindex Module Is Disabled"
+if apache2ctl -M | grep -q "autoindex_module"; then
+    print_status "Disabling autoindex_module..."
+    a2dismod autoindex
+else
+    print_status "autoindex_module is already disabled"
+fi
+
+# 2.6 Ensure the Proxy Modules Are Disabled if not in use (Automated)
+print_status "2.6 Ensure the Proxy Modules Are Disabled if not in use"
+if apache2ctl -M | grep -q "proxy_module"; then
+    print_status "Disabling proxy modules..."
+    a2dismod proxy
+    a2dismod proxy_http
+    a2dismod proxy_ftp
+else
+    print_status "Proxy modules are already disabled"
+fi
+
+# 2.7 Ensure the User Directories Module Is Disabled (Automated)
+print_status "2.7 Ensure the User Directories Module Is Disabled"
+if apache2ctl -M | grep -q "userdir_module"; then
+    print_status "Disabling userdir_module..."
+    a2dismod userdir
+else
+    print_status "userdir_module is already disabled"
+fi
+
+# 2.8 Ensure the Info Module Is Disabled (Automated)
+print_status "2.8 Ensure the Info Module Is Disabled"
+if apache2ctl -M | grep -q "info_module"; then
+    print_status "Disabling info_module..."
+    a2dismod info
+else
+    print_status "info_module is already disabled"
+fi
+
+# 2.9 Ensure the Basic and Digest Authentication Modules are Disabled (Automated)
+print_status "2.9 Ensure the Basic and Digest Authentication Modules are Disabled"
+if apache2ctl -M | grep -q "auth_basic_module"; then
+    print_status "Disabling auth_basic_module..."
+    a2dismod auth_basic
+fi
+
+if apache2ctl -M | grep -q "auth_digest_module"; then
+    print_status "Disabling auth_digest_module..."
+    a2dismod auth_digest
+else
+    print_status "Basic and Digest authentication modules are already disabled"
+fi
+
+# 3. Principles, Permissions, and Ownership
+print_status "Section 3: Principles, Permissions, and Ownership"
+
+# 3.1 Ensure the Apache Web Server Runs As a Non-Root User (Automated)
+print_status "3.1 Ensure the Apache Web Server Runs As a Non-Root User"
+if grep -q "^User $USER" "$APACHE_CONF"; then
+    print_status "Apache is already configured to run as non-root user: $USER"
+else
+    print_status "Configuring Apache to run as non-root user: $USER"
+    sed -i "s/^User .*/User $USER/" "$APACHE_CONF"
+fi
+
+# 3.2 Ensure the Apache User Account Has an Invalid Shell (Automated)
+print_status "3.2 Ensure the Apache User Account Has an Invalid Shell"
+if getent passwd "$USER" | grep -q "/usr/sbin/nologin\|/bin/false"; then
+    print_status "Apache user account already has an invalid shell"
+else
+    print_status "Setting invalid shell for Apache user account"
+    usermod -s /usr/sbin/nologin "$USER"
+fi
+
+# 3.3 Ensure the Apache User Account Is Locked (Automated)
+print_status "3.3 Ensure the Apache User Account Is Locked"
+if passwd -S "$USER" | grep -q "L"; then
+    print_status "Apache user account is already locked"
+else
+    print_status "Locking Apache user account"
+    passwd -l "$USER"
+fi
+
+# 3.4 Ensure Apache Directories and Files Are Owned By Root (Automated)
+print_status "3.4 Ensure Apache Directories and Files Are Owned By Root"
+print_status "Setting ownership of Apache directories and files to root"
+chown -R root:root "$APACHE_CONF_DIR"
+
+# 3.5 Ensure the Group Is Set Correctly on Apache Directories and Files (Automated)
+print_status "3.5 Ensure the Group Is Set Correctly on Apache Directories and Files"
+print_status "Setting group ownership of Apache directories and files to $GROUP"
+chown -R root:"$GROUP" "$APACHE_CONF_DIR"
+
+# 3.6 Ensure Other Write Access on Apache Directories and Files Is Restricted (Automated)
+print_status "3.6 Ensure Other Write Access on Apache Directories and Files Is Restricted"
+print_status "Removing write permissions for others on Apache directories and files"
+chmod -R o-w "$APACHE_CONF_DIR"
+
+# 3.7 Ensure the Core Dump Directory Is Secured (Manual)
+print_status "3.7 Ensure the Core Dump Directory Is Secured"
+print_warning "Manual step: Ensure the CoreDumpDirectory is secured"
+if grep -q "^CoreDumpDirectory" "$APACHE_CONF"; then
+    CORE_DUMP_DIR=$(grep "^CoreDumpDirectory" "$APACHE_CONF" | awk '{print $2}')
+    if [ -n "$CORE_DUMP_DIR" ]; then
+        print_status "Securing core dump directory: $CORE_DUMP_DIR"
+        mkdir -p "$CORE_DUMP_DIR"
+        chown root:"$GROUP" "$CORE_DUMP_DIR"
+        chmod 750 "$CORE_DUMP_DIR"
     fi
-done
-if [[ $is_invalid -eq 1 ]]; then
-    log_info "Apache user shell is '$apache_shell' (considered invalid)."
 else
-    log_warn "Apache user shell is '$apache_shell'. Setting to /sbin/nologin (or /usr/sbin/nologin)."
-    if command -v usermod > /dev/null; then
-        if [[ -e /sbin/nologin ]]; then
-             usermod -s /sbin/nologin "$APACHE_USER" || log_error "Failed to set shell for $APACHE_USER"
-        elif [[ -e /usr/sbin/nologin ]]; then
-             usermod -s /usr/sbin/nologin "$APACHE_USER" || log_error "Failed to set shell for $APACHE_USER"
-        else
-             usermod -s /bin/false "$APACHE_USER" || log_error "Failed to set shell for $APACHE_USER"
-        fi
+    print_status "CoreDumpDirectory not configured, adding configuration"
+    echo "CoreDumpDirectory /var/log/apache2/core-dumps" >> "$APACHE_CONF"
+    mkdir -p /var/log/apache2/core-dumps
+    chown root:"$GROUP" /var/log/apache2/core-dumps
+    chmod 750 /var/log/apache2/core-dumps
+fi
+
+# 3.8 Ensure the Lock File Is Secured (Manual)
+print_status "3.8 Ensure the Lock File Is Secured"
+print_warning "Manual step: Ensure the lock file is secured"
+if [ -f "$LOCK_FILE" ]; then
+    print_status "Securing lock file: $LOCK_FILE"
+    chown root:"$GROUP" "$LOCK_FILE"
+    chmod 640 "$LOCK_FILE"
+else
+    print_status "Lock file does not exist: $LOCK_FILE"
+fi
+
+# 3.9 Ensure the Pid File Is Secured (Manual)
+print_status "3.9 Ensure the Pid File Is Secured"
+print_warning "Manual step: Ensure the PID file is secured"
+if [ -f "$PID_FILE" ]; then
+    print_status "Securing PID file: $PID_FILE"
+    chown root:"$GROUP" "$PID_FILE"
+    chmod 640 "$PID_FILE"
+else
+    print_status "PID file does not exist: $PID_FILE"
+fi
+
+# 3.10 Ensure the ScoreBoard File Is Secured (Manual)
+print_status "3.10 Ensure the ScoreBoard File Is Secured"
+print_warning "Manual step: Ensure the scoreboard file is secured"
+if [ -f "$SCOREBOARD_FILE" ]; then
+    print_status "Securing scoreboard file: $SCOREBOARD_FILE"
+    chown root:"$GROUP" "$SCOREBOARD_FILE"
+    chmod 640 "$SCOREBOARD_FILE"
+else
+    print_status "Scoreboard file does not exist: $SCOREBOARD_FILE"
+fi
+
+# 3.11 Ensure Group Write Access for the Apache Directories and Files Is Properly Restricted (Manual)
+print_status "3.11 Ensure Group Write Access for the Apache Directories and Files Is Properly Restricted"
+print_warning "Manual step: Review and restrict group write access for Apache directories and files"
+print_status "Current permissions on Apache configuration directories:"
+find "$APACHE_CONF_DIR" -type d -exec ls -ld {} \;
+
+# 3.12 Ensure Group Write Access for the Document Root Directories and Files Is Properly Restricted (Manual)
+print_status "3.12 Ensure Group Write Access for the Document Root Directories and Files Is Properly Restricted"
+print_warning "Manual step: Review and restrict group write access for document root directories and files"
+print_status "Current permissions on document root directories:"
+find "$WWW_DIR" -type d -exec ls -ld {} \;
+
+# 3.13 Ensure Access to Special Purpose Application Writable Directories is Properly Restricted (Manual)
+print_status "3.13 Ensure Access to Special Purpose Application Writable Directories is Properly Restricted"
+print_warning "Manual step: Review and restrict access to special purpose application writable directories"
+
+# 4. Apache Access Control
+print_status "Section 4: Apache Access Control"
+
+# 4.1 Ensure Access to OS Root Directory Is Denied By Default (Automated)
+print_status "4.1 Ensure Access to OS Root Directory Is Denied By Default"
+if grep -q "<Directory />" "$APACHE_CONF"; then
+    if grep -A 5 "<Directory />" "$APACHE_CONF" | grep -q "Require all denied"; then
+        print_status "Access to OS root directory is already denied by default"
     else
-        log_warn "usermod command not found. Manually set shell for $APACHE_USER."
-    fi
-fi
-
-# 3.3 Ensure Apache user account is locked
-log_info "CIS 3.3: Ensure Apache user account ($APACHE_USER) is locked"
-if command -v passwd > /dev/null; then
-    passwd_status=$(passwd -S "$APACHE_USER" 2>/dev/null | awk '{print $2}')
-    if [[ "$passwd_status" == "L" || "$passwd_status" == "LK" ]]; then
-        log_info "Apache user account is locked."
-    elif [[ "$passwd_status" == "NP" ]]; then
-         log_info "Apache user account has no password set."
-    elif [[ "$passwd_status" == "P" || "$passwd_status" == "PS" ]]; then
-        log_warn "Apache user account has a password set. Locking account."
-        passwd -l "$APACHE_USER" || log_error "Failed to lock account $APACHE_USER."
-    else
-        log_warn "Could not reliably determine lock status for $APACHE_USER (Status: $passwd_status). Manual check recommended."
+        print_status "Configuring access to OS root directory to be denied by default"
+        sed -i '/<Directory \/>/,/<\/Directory>/ s/Require all granted/Require all denied/' "$APACHE_CONF"
     fi
 else
-     log_warn "passwd command not found. Manually verify $APACHE_USER account is locked."
-fi
-
-# 3.4, 3.5 Ownership (Manual Check Recommended)
-log_info "CIS 3.4, 3.5: Ensure Apache directories/files owned by root:root (Manual Check Recommended)"
-log_warn "Checking ownership of config directories. Files not owned by root:root will be listed."
-find "$APACHE_CONF_DIR" \( \! -user root -o \! -group root \) -ls
-log_warn "Review listed files. Run 'chown -R root:root /path/to/apache/config' if appropriate."
-
-# 3.6 Restrict 'Other' Write Access on Apache Dirs/Files
-log_info "CIS 3.6: Restricting 'Other' write access on Apache config/binary directories"
-# Be careful not to change permissions on DocRoot here
-find "$APACHE_CONF_DIR" -type f -perm /o=w -print -exec chmod o-w {} \;
-find "$APACHE_CONF_DIR" -type d -perm /o=w -print -exec chmod o-w {} \;
-# Also check common binary locations if known
-if [[ -d /usr/sbin/ ]]; then
-     find /usr/sbin/ -name "apache*" -o -name "httpd*" -perm /o=w -print -exec chmod o-w {} \;
-fi
-
-# 3.7 CoreDumpDirectory (Check if set, ensure disabled or secure)
-log_info "CIS 3.7: Secure Core Dump Directory (Ensuring disabled if possible)"
-# Core dumps usually disabled by default when switching to non-root user.
-# Check if explicitly enabled and secure if so.
-coredump_dir=$(grep -ihr '^\s*CoreDumpDirectory' "$APACHE_CONF_DIR" | awk '{print $2}')
-if [[ -n "$coredump_dir" ]]; then
-    log_warn "CoreDumpDirectory is set to '$coredump_dir'. Ensure this directory is secured (root owned, not world readable/writable). CIS recommends disabling."
-    # Consider commenting it out:
-    # find "$APACHE_CONF_DIR" -type f -name "*.conf" -print0 | xargs -0 sed -i 's/^\s*CoreDumpDirectory/#&/'
-else
-    log_info "CoreDumpDirectory not explicitly set (or commented out)."
-fi
-
-# 3.8, 3.9, 3.10 LockFile, PidFile, ScoreBoardFile (Secure Directories)
-log_info "CIS 3.8, 3.9, 3.10: Secure LockFile, PidFile, ScoreBoardFile directories"
-# Check common runtime directories like /run/apache2 or /run/httpd
-RUNTIME_DIR="/run/${APACHE_SERVICE}"
-if [[ -d "$RUNTIME_DIR" ]]; then
-     log_info "Checking permissions for runtime directory: $RUNTIME_DIR"
-     ls -ld "$RUNTIME_DIR"
-     if ! stat -c "%U:%G %a" "$RUNTIME_DIR" | grep -q "root:root 755"; then # Or stricter like 700 if group doesn't need access
-         log_warn "Permissions for $RUNTIME_DIR are not ideal (expected root:root 755 or similar). Review manually."
-         # Consider: chmod 755 "$RUNTIME_DIR"; chown root:root "$RUNTIME_DIR"
-     fi
-     find "$RUNTIME_DIR" -type f \( -perm /g=w -o -perm /o=w \) -ls # Files inside should not be group/other writable
-     # Consider: find "$RUNTIME_DIR" -type f -exec chmod go-w {} \;
-else
-     log_warn "Could not find common runtime directory $RUNTIME_DIR. Manual check for PidFile/LockFile paths needed."
-fi
-# Check Log directory permissions if Mutex file:/ Scoreboard file: used there
-LOG_DIR=$(grep -ih '^\s*ErrorLog' "$APACHE_CONF_DIR"/*conf* "$APACHE_CONF_DIR"/sites-enabled/* "$APACHE_CONF_DIR"/conf.d/* 2>/dev/null | sed -n 's#^[ \t]*ErrorLog[ \t]*"\?\([^/][^"]*\)"\?#logs/\1#p; s#^[ \t]*ErrorLog[ \t]*"\?\(/[^"]*\)"\?#\1#p' | xargs dirname | sort -u | head -n 1)
-if [[ -n "$LOG_DIR" && -d "$LOG_DIR" ]]; then
-    log_info "Checking log directory permissions ($LOG_DIR) relevant for potential Mutex/Scoreboard files."
-    ls -ld "$LOG_DIR"
-    # Log dir often needs write access for apache group, but 'other' should be restricted
-    find "$LOG_DIR" -maxdepth 0 -perm /o=wx -print -exec chmod o-wx {} \; # Restrict 'other' execute needed to enter dir
-fi
-
-# 3.11 Restrict Group Write on Apache Dirs/Files
-log_info "CIS 3.11: Restricting Group write access on Apache config/binary directories"
-find "$APACHE_CONF_DIR" -type f -perm /g=w -print -exec chmod g-w {} \;
-find "$APACHE_CONF_DIR" -type d -perm /g=w -print -exec chmod g-w {} \;
-if [[ -d /usr/sbin/ ]]; then
-     find /usr/sbin/ -name "apache*" -o -name "httpd*" -perm /g=w -print -exec chmod g-w {} \;
-fi
-
-# 3.12 Restrict Group Write for Apache *RUNTIME* Group on DocRoot
-log_info "CIS 3.12: Restricting Group write access for '$APACHE_GROUP' on DocumentRoot '$APACHE_DOC_ROOT'"
-if [[ -d "$APACHE_DOC_ROOT" ]]; then
-    log_info "Files/Dirs in DocumentRoot writable by group '$APACHE_GROUP':"
-    find "$APACHE_DOC_ROOT" -group "$APACHE_GROUP" -perm /g=w -ls
-    log_info "Applying chmod g-w to files/dirs in DocumentRoot owned by group '$APACHE_GROUP'."
-    find "$APACHE_DOC_ROOT" -group "$APACHE_GROUP" -perm /g=w -exec chmod g-w {} \;
-else
-    log_warn "DocumentRoot '$APACHE_DOC_ROOT' not found. Skipping check 3.12."
-fi
-
-# 3.13 Special Purpose Writable Dirs (Manual)
-log_info "CIS 3.13: Ensure Special Purpose Application Writable Dirs Restricted (Manual)"
-log_warn "If applications need writable directories, ensure they are OUTSIDE DocumentRoot, single-purpose, root owned, and not world-writable."
-
-# --- Section 4: Apache Access Control ---
-log_info "CIS Section 4: Apache Access Control"
-
-# 4.1 Deny OS Root Directory Access
-log_info "CIS 4.1: Denying access to OS Root Directory ('<Directory />')"
-# Ensure <Directory /> block exists and has Require all denied
-# We add this to the main config file for simplicity, might exist elsewhere
-backup_config "$APACHE_CONF_FILE"
-if ! grep -q '^\s*<Directory\s*/\s*>' "$APACHE_CONF_FILE"; then
-    log_info "Adding '<Directory />' block to $APACHE_CONF_FILE"
-    cat << EOF >> "$APACHE_CONF_FILE"
+    print_status "Adding directory configuration for OS root directory"
+    cat >> "$APACHE_CONF" << EOF
 
 <Directory />
+    Options None
     AllowOverride None
     Require all denied
 </Directory>
 EOF
-else
-    log_info "Configuring '<Directory />' block in $APACHE_CONF_FILE"
-    # Use awk to ensure directives are inside the block
-    awk '
-    BEGIN { in_block=0; printed_req=0; printed_ao=0 }
-    /^\s*<Directory\s*\/\s*>/ { print; in_block=1; next }
-    in_block && /^\s*Require\s+all\s+denied/ { print; printed_req=1; next }
-    in_block && /^\s*AllowOverride\s+None/ { print; printed_ao=1; next }
-    in_block && /^\s*AllowOverrideList\s+None/ { print; printed_ao=1; next } # Alternative
-    in_block && /^\s*Order\s+/ { next } # Remove deprecated Order
-    in_block && /^\s*Deny\s+/ { next } # Remove deprecated Deny
-    in_block && /^\s*Allow\s+/ { next } # Remove deprecated Allow
-    in_block && /^\s*Require\s+/ { next } # Remove other Require directives
-    in_block && /^\s*AllowOverride\s+/ { next } # Remove other AllowOverride
-    in_block && /^\s*AllowOverrideList\s+/ { next } # Remove other AllowOverrideList
-    /^\s*<\/Directory\s*>/ && in_block {
-        if (!printed_ao) print "    AllowOverride None";
-        if (!printed_req) print "    Require all denied";
-        print;
-        in_block=0; printed_req=0; printed_ao=0;
-        next;
-    }
-    { print }
-    ' "$APACHE_CONF_FILE" > temp_$$ && mv temp_$$ "$APACHE_CONF_FILE"
 fi
 
-# 4.2 Allow Web Content Access (Manual) - Must be configured by user based on DocRoot
-log_info "CIS 4.2: Ensure Appropriate Access to Web Content Is Allowed (Manual)"
-log_warn "You MUST configure appropriate '<Directory $APACHE_DOC_ROOT>' or similar blocks with 'Require' directives to allow access to your web content."
-# Example (Needs manual confirmation/adjustment):
-# configure_block "<Directory \"${APACHE_DOC_ROOT}\">" "Require" "all granted"
-
-# 4.3 Disable OverRide for OS Root Directory
-log_info "CIS 4.3: Ensure AllowOverride is None for OS Root Directory ('<Directory />')"
-# Handled by the awk script in 4.1
-
-# 4.4 Disable OverRide for All Directories (Check only, modification complex)
-log_info "CIS 4.4: Ensure AllowOverride is None for All Directories (Checking for non-None values)"
-override_issues=$(get_config_files | xargs grep -Ei '^\s*AllowOverride(List)?\s+(?!None)')
-if [[ -n "$override_issues" ]]; then
-    log_warn "Found AllowOverride directives not set to 'None'. Review these:"
-    echo "$override_issues"
+# 4.2 Ensure Appropriate Access to Web Content Is Allowed (Manual)
+print_status "4.2 Ensure Appropriate Access to Web Content Is Allowed"
+print_warning "Manual step: Review and configure appropriate access to web content"
+if grep -q "<Directory $WWW_DIR>" "$APACHE_CONF"; then
+    print_status "Web content directory is already configured"
 else
-    log_info "No AllowOverride directives found that are not 'None' (excluding OS root handled above)."
-fi
+    print_status "Adding directory configuration for web content"
+    cat >> "$APACHE_CONF" << EOF
 
-# --- Section 5: Minimize Features, Content and Options ---
-log_info "CIS Section 5: Minimizing Features, Content, Options"
-
-# 5.1 Restrict Options for OS Root Directory
-log_info "CIS 5.1: Restricting Options for OS Root Directory ('<Directory />')"
-configure_block '<Directory\s*/\s*>' "Options" "None"
-
-# 5.2 Restrict Options for Web Root Directory
-log_info "CIS 5.2: Restricting Options for Web Root Directory ('<Directory $APACHE_DOC_ROOT>')"
-# Common safe default allows following symlinks if needed, disallows Indexes, CGI, SSI
-# Adjust if FollowSymLinks is not needed or MultiViews is required.
-configure_block "<Directory \"${APACHE_DOC_ROOT}\">" "Options" "FollowSymLinks"
-# Or stricter: configure_block "<Directory \"${APACHE_DOC_ROOT}\">" "Options" "None"
-
-# 5.3 Minimize Options for Other Directories (Check only)
-log_info "CIS 5.3: Minimizing Options for Other Directories (Checking for Includes, ExecCGI)"
-options_includes=$(get_config_files | xargs grep -Ei '^\s*Options\s+.*\bIncludes\b')
-options_execcgi=$(get_config_files | xargs grep -Ei '^\s*Options\s+.*\bExecCGI\b')
-if [[ -n "$options_includes" ]]; then log_warn "Found 'Options Includes'. Review if needed for SSI: $options_includes"; fi
-if [[ -n "$options_execcgi" ]]; then log_warn "Found 'Options ExecCGI'. Review if needed for CGI execution: $options_execcgi"; fi
-
-# 5.4, 5.5, 5.6 Remove Default Content/CGIs (Manual)
-log_info "CIS 5.4: Ensure Default HTML Content Is Removed (Manual)"
-log_info "CIS 5.5: Ensure Default CGI 'printenv' Script Is Removed (Manual)"
-log_info "CIS 5.6: Ensure Default CGI 'test-cgi' Script Is Removed (Manual)"
-log_warn "Manually remove default welcome pages, icons, manuals, and CGI scripts."
-
-# 5.7 Restrict HTTP Request Methods
-log_info "CIS 5.7: Restricting HTTP Request Methods (Applying to DocRoot)"
-# Apply to DocumentRoot block. Assumes $APACHE_DOC_ROOT is set.
-if [[ -d "$APACHE_DOC_ROOT" ]]; then
-    # Find the config file containing the DocRoot Directory block
-     docroot_conf=$(get_config_files | xargs grep -l "<Directory \"${APACHE_DOC_ROOT}\">" | head -n 1)
-     if [[ -n "$docroot_conf" ]]; then
-         backup_config "$docroot_conf"
-         log_info "Adding LimitExcept to block '<Directory \"${APACHE_DOC_ROOT}\">' in $docroot_conf"
-         # Use awk to add the block after the Directory opening tag
-         awk -v block_start="<Directory \"${APACHE_DOC_ROOT}\">" '
-         1;
-         $0 ~ block_start {
-             print "    <LimitExcept GET POST OPTIONS HEAD>";
-             print "        Require all denied";
-             print "    </LimitExcept>";
-         }
-         ' "$docroot_conf" > temp_$$ && mv temp_$$ "$docroot_conf"
-     else
-        log_warn "Could not find config file for DocumentRoot block. Manual LimitExcept needed."
-     fi
-else
-    log_warn "DocumentRoot '$APACHE_DOC_ROOT' not found. Skipping method restriction 5.7."
-fi
-
-# 5.8 Disable TRACE Method
-log_info "CIS 5.8: Disabling HTTP TRACE method"
-set_directive "TraceEnable" "Off" "$PRIMARY_CONF_FILE"
-
-# 5.9 Disallow Old HTTP Protocol Versions
-log_info "CIS 5.9: Disallowing old HTTP protocol versions (Requires mod_rewrite)"
-manage_module "rewrite" "enable"
-backup_config "$PRIMARY_CONF_FILE"
-# Add rewrite rules if not present
-if ! grep -q 'RewriteCond %{THE_REQUEST} !(HTTP/1\.1|HTTP/2\.0)$' "$PRIMARY_CONF_FILE"; then
-    log_info "Adding mod_rewrite rules to disallow old HTTP protocols in $PRIMARY_CONF_FILE"
-    cat << EOF >> "$PRIMARY_CONF_FILE"
-
-RewriteEngine On
-RewriteCond %{THE_REQUEST} !(HTTP/1\.1|HTTP/2\.0)$
-RewriteRule .* - [F]
+<Directory $WWW_DIR>
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
 EOF
-else
-    log_info "mod_rewrite rules for HTTP protocol check seem present in $PRIMARY_CONF_FILE."
-    set_directive "RewriteEngine" "On" "$PRIMARY_CONF_FILE" # Ensure it's On
 fi
 
-# 5.10 Restrict Access to .ht* files
-log_info "CIS 5.10: Restricting access to .ht* files"
-backup_config "$PRIMARY_CONF_FILE"
-if ! grep -q '<FilesMatch "\^\\.ht">' "$PRIMARY_CONF_FILE"; then
-    log_info "Adding FilesMatch for .ht* files to $PRIMARY_CONF_FILE"
-    cat << EOF >> "$PRIMARY_CONF_FILE"
+# 4.3 Ensure OverRide Is Disabled for the OS Root Directory (Automated)
+print_status "4.3 Ensure OverRide Is Disabled for the OS Root Directory"
+if grep -A 5 "<Directory />" "$APACHE_CONF" | grep -q "AllowOverride None"; then
+    print_status "Override is already disabled for the OS root directory"
+else
+    print_status "Disabling Override for the OS root directory"
+    sed -i '/<Directory \/>/,/<\/Directory>/ s/AllowOverride .*/AllowOverride None/' "$APACHE_CONF"
+fi
 
-<FilesMatch "^\\.ht">
+# 4.4 Ensure OverRide Is Disabled for All Directories (Automated)
+print_status "4.4 Ensure OverRide Is Disabled for All Directories"
+if grep -q "AllowOverride None" "$APACHE_CONF"; then
+    print_status "Override is already disabled for all directories"
+else
+    print_status "Disabling Override for all directories"
+    sed -i 's/AllowOverride .*/AllowOverride None/g' "$APACHE_CONF"
+fi
+
+# 5. Minimize Features, Content and Options
+print_status "Section 5: Minimize Features, Content and Options"
+
+# 5.1 Ensure Options for the OS Root Directory Are Restricted (Automated)
+print_status "5.1 Ensure Options for the OS Root Directory Are Restricted"
+if grep -A 5 "<Directory />" "$APACHE_CONF" | grep -q "Options None"; then
+    print_status "Options for the OS root directory are already restricted"
+else
+    print_status "Restricting options for the OS root directory"
+    sed -i '/<Directory \/>/,/<\/Directory>/ s/Options .*/Options None/' "$APACHE_CONF"
+fi
+
+# 5.2 Ensure Options for the Web Root Directory Are Restricted (Automated)
+print_status "5.2 Ensure Options for the Web Root Directory Are Restricted"
+if grep -A 5 "<Directory $WWW_DIR>" "$APACHE_CONF" | grep -q "Options None"; then
+    print_status "Options for the web root directory are already restricted"
+else
+    print_status "Restricting options for the web root directory"
+    sed -i "/<Directory $WWW_DIR>/,/<\/Directory>/ s/Options .*/Options None/" "$APACHE_CONF"
+fi
+
+# 5.3 Ensure Options for Other Directories Are Minimized (Automated)
+print_status "5.3 Ensure Options for Other Directories Are Minimized"
+print_warning "Manual step: Review and minimize options for other directories"
+print_status "Current directory configurations:"
+grep -n "<Directory" "$APACHE_CONF"
+
+# 5.4 Ensure Default HTML Content Is Removed (Manual)
+print_status "5.4 Ensure Default HTML Content Is Removed"
+if [ -f "$WWW_DIR/index.html" ]; then
+    print_status "Removing default HTML content"
+    rm -f "$WWW_DIR/index.html"
+else
+    print_status "Default HTML content is already removed"
+fi
+
+# 5.5 Ensure the Default CGI Content printenv Script Is Removed (Manual)
+print_status "5.5 Ensure the Default CGI Content printenv Script Is Removed"
+if [ -f "/usr/lib/cgi-bin/printenv" ]; then
+    print_status "Removing default CGI content printenv script"
+    rm -f "/usr/lib/cgi-bin/printenv"
+else
+    print_status "Default CGI content printenv script is already removed"
+fi
+
+# 5.6 Ensure the Default CGI Content test-cgi Script Is Removed (Manual)
+print_status "5.6 Ensure the Default CGI Content test-cgi Script Is Removed"
+if [ -f "/usr/lib/cgi-bin/test-cgi" ]; then
+    print_status "Removing default CGI content test-cgi script"
+    rm -f "/usr/lib/cgi-bin/test-cgi"
+else
+    print_status "Default CGI content test-cgi script is already removed"
+fi
+
+# 5.7 Ensure HTTP Request Methods Are Restricted (Manual)
+print_status "5.7 Ensure HTTP Request Methods Are Restricted"
+print_warning "Manual step: Review and restrict HTTP request methods"
+if grep -q "<LimitExcept GET POST HEAD>" "$APACHE_CONF"; then
+    print_status "HTTP request methods are already restricted"
+else
+    print_status "Adding configuration to restrict HTTP request methods"
+    cat >> "$APACHE_CONF" << EOF
+
+<LimitExcept GET POST HEAD>
+    Require all denied
+</LimitExcept>
+EOF
+fi
+
+# 5.8 Ensure the HTTP TRACE Method Is Disabled (Automated)
+print_status "5.8 Ensure the HTTP TRACE Method Is Disabled"
+if grep -q "TraceEnable Off" "$APACHE_CONF"; then
+    print_status "HTTP TRACE method is already disabled"
+else
+    print_status "Disabling HTTP TRACE method"
+    echo "TraceEnable Off" >> "$APACHE_CONF"
+fi
+
+# 5.9 Ensure Old HTTP Protocol Versions Are Disallowed (Automated)
+print_status "5.9 Ensure Old HTTP Protocol Versions Are Disallowed"
+if grep -q "Protocols" "$APACHE_CONF"; then
+    print_status "HTTP protocol versions are already configured"
+else
+    print_status "Configuring HTTP protocol versions"
+    echo "Protocols h2 h2c http/1.1" >> "$APACHE_CONF"
+fi
+
+# 5.10 Ensure Access to .ht* Files Is Restricted (Automated)
+print_status "5.10 Ensure Access to .ht* Files Is Restricted"
+if grep -q "<Files \"^.ht\">" "$APACHE_CONF"; then
+    print_status "Access to .ht* files is already restricted"
+else
+    print_status "Restricting access to .ht* files"
+    cat >> "$APACHE_CONF" << EOF
+
+<Files "^\.ht">
+    Require all denied
+</Files>
+EOF
+fi
+
+# 5.11 Ensure Access to .git Files Is Restricted (Manual)
+print_status "5.11 Ensure Access to .git Files Is Restricted"
+if grep -q "<DirectoryMatch \"\.git\">" "$APACHE_CONF"; then
+    print_status "Access to .git files is already restricted"
+else
+    print_status "Restricting access to .git files"
+    cat >> "$APACHE_CONF" << EOF
+
+<DirectoryMatch "\.git">
+    Require all denied
+</DirectoryMatch>
+EOF
+fi
+
+# 5.12 Ensure Access to .svn Files Is Restricted (Manual)
+print_status "5.12 Ensure Access to .svn Files Is Restricted"
+if grep -q "<DirectoryMatch \"\.svn\">" "$APACHE_CONF"; then
+    print_status "Access to .svn files is already restricted"
+else
+    print_status "Restricting access to .svn files"
+    cat >> "$APACHE_CONF" << EOF
+
+<DirectoryMatch "\.svn">
+    Require all denied
+</DirectoryMatch>
+EOF
+fi
+
+# 5.13 Ensure Access to Inappropriate File Extensions Is Restricted (Manual)
+print_status "5.13 Ensure Access to Inappropriate File Extensions Is Restricted"
+print_warning "Manual step: Review and restrict access to inappropriate file extensions"
+if grep -q "<FilesMatch \"\.(bak|config|dist|fla|inc|ini|log|psd|sh|sql|swp)$\">" "$APACHE_CONF"; then
+    print_status "Access to inappropriate file extensions is already restricted"
+else
+    print_status "Restricting access to inappropriate file extensions"
+    cat >> "$APACHE_CONF" << EOF
+
+<FilesMatch "\.(bak|config|dist|fla|inc|ini|log|psd|sh|sql|swp)$">
     Require all denied
 </FilesMatch>
 EOF
-else
-    log_info "FilesMatch for .ht* seems present in $PRIMARY_CONF_FILE."
-    # Could verify Require all denied inside block here if needed
 fi
 
-# 5.11 Restrict Access to .git files/directories
-log_info "CIS 5.11: Restricting access to .git files/directories"
-backup_config "$PRIMARY_CONF_FILE"
-if ! grep -q '<DirectoryMatch "/\\.git">' "$PRIMARY_CONF_FILE"; then
-     log_info "Adding DirectoryMatch for .git to $PRIMARY_CONF_FILE"
-    cat << EOF >> "$PRIMARY_CONF_FILE"
+# 5.14 Ensure IP Address Based Requests Are Disallowed (Automated)
+print_status "5.14 Ensure IP Address Based Requests Are Disallowed"
+if grep -q "UseCanonicalName On" "$APACHE_CONF"; then
+    print_status "IP address based requests are already disallowed"
+else
+    print_status "Disallowing IP address based requests"
+    echo "UseCanonicalName On" >> "$APACHE_CONF"
+fi
 
-<DirectoryMatch "/\\.git">
-    Require all denied
-</DirectoryMatch>
+# 5.15 Ensure the IP Addresses for Listening for Requests Are Specified (Automated)
+print_status "5.15 Ensure the IP Addresses for Listening for Requests Are Specified"
+if grep -q "Listen 80" "$APACHE_CONF_DIR/ports.conf"; then
+    print_status "IP addresses for listening are already specified"
+else
+    print_status "Configuring IP addresses for listening"
+    sed -i 's/Listen 80/Listen 0.0.0.0:80/' "$APACHE_CONF_DIR/ports.conf"
+fi
+
+# 5.16 Ensure Browser Framing Is Restricted (Automated)
+print_status "5.16 Ensure Browser Framing Is Restricted"
+if grep -q "Header always set X-Frame-Options" "$APACHE_CONF"; then
+    print_status "Browser framing is already restricted"
+else
+    print_status "Restricting browser framing"
+    echo "Header always set X-Frame-Options \"SAMEORIGIN\"" >> "$APACHE_CONF"
+    a2enmod headers
+fi
+
+# 5.17 Ensure HTTP Header Referrer-Policy is set appropriately (Manual)
+print_status "5.17 Ensure HTTP Header Referrer-Policy is set appropriately"
+if grep -q "Header always set Referrer-Policy" "$APACHE_CONF"; then
+    print_status "HTTP Header Referrer-Policy is already set"
+else
+    print_status "Setting HTTP Header Referrer-Policy"
+    echo "Header always set Referrer-Policy \"strict-origin-when-cross-origin\"" >> "$APACHE_CONF"
+    a2enmod headers
+fi
+
+# 5.18 Ensure HTTP Header Permissions-Policy is set appropriately (Manual)
+print_status "5.18 Ensure HTTP Header Permissions-Policy is set appropriately"
+if grep -q "Header always set Permissions-Policy" "$APACHE_CONF"; then
+    print_status "HTTP Header Permissions-Policy is already set"
+else
+    print_status "Setting HTTP Header Permissions-Policy"
+    echo "Header always set Permissions-Policy \"geolocation=(), microphone=(), camera=()\"" >> "$APACHE_CONF"
+    a2enmod headers
+fi
+
+# 6. Operations - Logging, Monitoring and Maintenance
+print_status "Section 6: Operations - Logging, Monitoring and Maintenance"
+
+# 6.1 Ensure the Error Log Filename and Severity Level Are Configured Correctly (Automated)
+print_status "6.1 Ensure the Error Log Filename and Severity Level Are Configured Correctly"
+if grep -q "ErrorLog" "$APACHE_CONF"; then
+    print_status "Error log is already configured"
+else
+    print_status "Configuring error log"
+    echo "ErrorLog $LOG_DIR/error.log" >> "$APACHE_CONF"
+fi
+
+if grep -q "LogLevel" "$APACHE_CONF"; then
+    print_status "Log level is already configured"
+else
+    print_status "Configuring log level"
+    echo "LogLevel warn" >> "$APACHE_CONF"
+fi
+
+# 6.2 Ensure a Syslog Facility Is Configured for Error Logging (Manual)
+print_status "6.2 Ensure a Syslog Facility Is Configured for Error Logging"
+print_warning "Manual step: Configure a syslog facility for error logging"
+if grep -q "ErrorLog syslog" "$APACHE_CONF"; then
+    print_status "Syslog facility is already configured for error logging"
+else
+    print_status "Adding syslog facility configuration for error logging"
+    echo "ErrorLog syslog:local7" >> "$APACHE_CONF"
+fi
+
+# 6.3 Ensure the Server Access Log Is Configured Correctly (Manual)
+print_status "6.3 Ensure the Server Access Log Is Configured Correctly"
+if grep -q "CustomLog" "$APACHE_CONF"; then
+    print_status "Server access log is already configured"
+else
+    print_status "Configuring server access log"
+    echo "CustomLog $LOG_DIR/access.log combined" >> "$APACHE_CONF"
+fi
+
+# 6.4 Ensure Log Storage and Rotation Is Configured Correctly (Manual)
+print_status "6.4 Ensure Log Storage and Rotation Is Configured Correctly"
+print_warning "Manual step: Configure log storage and rotation"
+if [ -f "/etc/logrotate.d/apache2" ]; then
+    print_status "Log rotation is already configured"
+else
+    print_status "Adding log rotation configuration"
+    cat > "/etc/logrotate.d/apache2" << EOF
+ $LOG_DIR/*.log {
+    daily
+    missingok
+    rotate 52
+    compress
+    delaycompress
+    notifempty
+    create 640 root adm
+    sharedscripts
+    postrotate
+        if /etc/init.d/apache2 status > /dev/null 2>&1; then
+            /etc/init.d/apache2 reload > /dev/null 2>&1;
+        fi;
+    endscript
+}
 EOF
-else
-    log_info "DirectoryMatch for .git seems present in $PRIMARY_CONF_FILE."
 fi
 
-# 5.12 Restrict Access to .svn files/directories
-log_info "CIS 5.12: Restricting access to .svn files/directories"
-backup_config "$PRIMARY_CONF_FILE"
-if ! grep -q '<DirectoryMatch "/\\.svn">' "$PRIMARY_CONF_FILE"; then
-    log_info "Adding DirectoryMatch for .svn to $PRIMARY_CONF_FILE"
-    cat << EOF >> "$PRIMARY_CONF_FILE"
+# 6.5 Ensure Applicable Patches Are Applied (Manual)
+print_status "6.5 Ensure Applicable Patches Are Applied"
+print_warning "Manual step: Ensure applicable patches are applied"
+print_status "Updating Apache2 package..."
+apt-get upgrade -y apache2
 
-<DirectoryMatch "/\\.svn">
-    Require all denied
-</DirectoryMatch>
+# 6.6 Ensure ModSecurity Is Installed and Enabled (Automated)
+print_status "6.6 Ensure ModSecurity Is Installed and Enabled"
+if ! dpkg -l | grep -q "libapache2-mod-security2"; then
+    print_status "Installing ModSecurity..."
+    apt-get install -y libapache2-mod-security2
+else
+    print_status "ModSecurity is already installed"
+fi
+
+if apache2ctl -M | grep -q "security2_module"; then
+    print_status "ModSecurity is already enabled"
+else
+    print_status "Enabling ModSecurity..."
+    a2enmod security2
+fi
+
+if [ -f "/etc/modsecurity/modsecurity.conf-recommended" ] && [ ! -f "/etc/modsecurity/modsecurity.conf" ]; then
+    print_status "Configuring ModSecurity..."
+    cp "/etc/modsecurity/modsecurity.conf-recommended" "/etc/modsecurity/modsecurity.conf"
+    sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' "/etc/modsecurity/modsecurity.conf"
+fi
+
+# 6.7 Ensure the OWASP ModSecurity Core Rule Set Is Installed and Enabled (Manual)
+print_status "6.7 Ensure the OWASP ModSecurity Core Rule Set Is Installed and Enabled"
+if [ ! -d "/usr/share/modsecurity-crs" ]; then
+    print_status "Installing OWASP ModSecurity Core Rule Set..."
+    apt-get install -y modsecurity-crs
+else
+    print_status "OWASP ModSecurity Core Rule Set is already installed"
+fi
+
+if [ -f "/etc/modsecurity/crs/crs-setup.conf.example" ] && [ ! -f "/etc/modsecurity/crs/crs-setup.conf" ]; then
+    print_status "Configuring OWASP ModSecurity Core Rule Set..."
+    cp "/etc/modsecurity/crs/crs-setup.conf.example" "/etc/modsecurity/crs/crs-setup.conf"
+fi
+
+# 7. SSL/TLS Configuration
+print_status "Section 7: SSL/TLS Configuration"
+
+# 7.1 Ensure mod_ssl and/or mod_nss Is Installed (Automated)
+print_status "7.1 Ensure mod_ssl Is Installed"
+if ! dpkg -l | grep -q "ssl"; then
+    print_status "Installing SSL module..."
+    apt-get install -y ssl-cert
+    a2enmod ssl
+else
+    print_status "SSL module is already installed"
+fi
+
+if apache2ctl -M | grep -q "ssl_module"; then
+    print_status "SSL module is already enabled"
+else
+    print_status "Enabling SSL module..."
+    a2enmod ssl
+fi
+
+# 7.2 Ensure a Valid Trusted Certificate Is Installed (Manual)
+print_status "7.2 Ensure a Valid Trusted Certificate Is Installed"
+print_warning "Manual step: Install a valid trusted certificate"
+if [ -f "/etc/ssl/certs/ssl-cert-snakeoil.pem" ] && [ -f "/etc/ssl/private/ssl-cert-snakeoil.key" ]; then
+    print_status "Default snakeoil certificate is available"
+    print_warning "Replace with a valid trusted certificate in production"
+else
+    print_status "Creating default snakeoil certificate"
+    make-ssl-cert generate-default-snakeoil --force-overwrite
+fi
+
+# 7.3 Ensure the Server's Private Key Is Protected (Manual)
+print_status "7.3 Ensure the Server's Private Key Is Protected"
+print_warning "Manual step: Ensure the server's private key is protected"
+if [ -f "/etc/ssl/private/ssl-cert-snakeoil.key" ]; then
+    print_status "Setting permissions on private key"
+    chmod 600 "/etc/ssl/private/ssl-cert-snakeoil.key"
+    chown root:root "/etc/ssl/private/ssl-cert-snakeoil.key"
+fi
+
+# 7.4 Ensure the TLSv1.0 and TLSv1.1 Protocols are Disabled (Manual)
+print_status "7.4 Ensure the TLSv1.0 and TLSv1.1 Protocols are Disabled"
+if grep -q "SSLProtocol" "$APACHE_CONF"; then
+    print_status "SSL protocol is already configured"
+else
+    print_status "Configuring SSL protocol to disable TLSv1.0 and TLSv1.1"
+    echo "SSLProtocol all -SSLv2 -SSLv3 -TLSv1 -TLSv1.1" >> "$APACHE_CONF"
+fi
+
+# 7.5 Ensure Weak SSL/TLS Ciphers Are Disabled (Manual)
+print_status "7.5 Ensure Weak SSL/TLS Ciphers Are Disabled"
+if grep -q "SSLCipherSuite" "$APACHE_CONF"; then
+    print_status "SSL cipher suite is already configured"
+else
+    print_status "Configuring SSL cipher suite to disable weak ciphers"
+    echo "SSLCipherSuite HIGH:!aNULL:!MD5:!3DES" >> "$APACHE_CONF"
+fi
+
+# 7.6 Ensure Insecure SSL Renegotiation Is Not Enabled (Manual)
+print_status "7.6 Ensure Insecure SSL Renegotiation Is Not Enabled"
+if grep -q "SSLInsecureRenegotiation" "$APACHE_CONF"; then
+    print_status "SSL renegotiation is already configured"
+else
+    print_status "Configuring SSL renegotiation"
+    echo "SSLInsecureRenegotiation off" >> "$APACHE_CONF"
+fi
+
+# 7.7 Ensure SSL Compression is not Enabled (Manual)
+print_status "7.7 Ensure SSL Compression is not Enabled"
+if grep -q "SSLCompression" "$APACHE_CONF"; then
+    print_status "SSL compression is already configured"
+else
+    print_status "Configuring SSL compression"
+    echo "SSLCompression off" >> "$APACHE_CONF"
+fi
+
+# 7.8 Ensure Medium Strength SSL/TLS Ciphers Are Disabled (Manual)
+print_status "7.8 Ensure Medium Strength SSL/TLS Ciphers Are Disabled"
+if grep -q "SSLCipherSuite" "$APACHE_CONF"; then
+    print_status "SSL cipher suite is already configured"
+else
+    print_status "Configuring SSL cipher suite to disable medium strength ciphers"
+    echo "SSLCipherSuite ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256" >> "$APACHE_CONF"
+fi
+
+# 7.9 Ensure All Web Content is Accessed via HTTPS (Manual)
+print_status "7.9 Ensure All Web Content is Accessed via HTTPS"
+print_warning "Manual step: Configure all web content to be accessed via HTTPS"
+if [ -f "$SITES_AVAILABLE/default-ssl.conf" ]; then
+    print_status "SSL site configuration is already available"
+else
+    print_status "Creating SSL site configuration"
+    cp "$SITES_AVAILABLE/default-ssl.conf" "$SITES_AVAILABLE/default-ssl.conf.bak"
+    cat > "$SITES_AVAILABLE/default-ssl.conf" << EOF
+<IfModule mod_ssl.c>
+    <VirtualHost _default_:443>
+        ServerAdmin webmaster@localhost
+        DocumentRoot $WWW_DIR
+
+        ErrorLog $LOG_DIR/error.log
+        CustomLog $LOG_DIR/access.log combined
+
+        SSLEngine on
+        SSLCertificateFile    /etc/ssl/certs/ssl-cert-snakeoil.pem
+        SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+
+        <FilesMatch "\.(cgi|shtml|phtml|php)$">
+            SSLOptions +StdEnvVars
+        </FilesMatch>
+        <Directory /usr/lib/cgi-bin>
+            SSLOptions +StdEnvVars
+        </Directory>
+
+        BrowserMatch "MSIE [2-6]" \
+            nokeepalive ssl-unclean-shutdown \
+            downgrade-1.0 force-response-1.0
+        BrowserMatch "MSIE [17-9]" ssl-unclean-shutdown
+    </VirtualHost>
+</IfModule>
 EOF
+fi
+
+if [ ! -L "$SITES_ENABLED/default-ssl.conf" ]; then
+    print_status "Enabling SSL site"
+    a2ensite default-ssl
+fi
+
+# 7.10 Ensure OCSP Stapling Is Enabled (Manual)
+print_status "7.10 Ensure OCSP Stapling Is Enabled"
+if grep -q "SSLUseStapling" "$APACHE_CONF"; then
+    print_status "OCSP stapling is already configured"
 else
-     log_info "DirectoryMatch for .svn seems present in $PRIMARY_CONF_FILE."
+    print_status "Configuring OCSP stapling"
+    echo "SSLUseStapling on" >> "$APACHE_CONF"
+    echo "SSLStaplingCache \"shmcb:/var/run/ocsp(128000)\"" >> "$APACHE_CONF"
 fi
 
-# 5.13 Restrict Inappropriate File Extensions (Level 2 - Manual)
-log_info "CIS 5.13: Restrict Inappropriate File Extensions (Level 2 - Manual)"
-log_warn "Define allowed extensions using FilesMatch. Requires analysis of site content."
-# Example (Add to $PRIMARY_CONF_FILE):
-# <FilesMatch "\.(?!(html|htm|css|js|png|jpe?g|gif|pdf)$)">  # Adjust extensions
-#    Require all denied
-# </FilesMatch>
-
-# 5.14 Disallow IP Address Based Requests (Level 2 - Requires mod_rewrite)
-log_info "CIS 5.14: Disallowing IP address based requests (Level 2 - Requires mod_rewrite)"
-manage_module "rewrite" "enable"
-backup_config "$PRIMARY_CONF_FILE"
-if ! grep -q 'RewriteCond %{HTTP_HOST} ^[0-9]' "$PRIMARY_CONF_FILE"; then # Basic check for IP host
-    log_info "Adding mod_rewrite rule to disallow IP-based Host headers in $PRIMARY_CONF_FILE"
-    cat << EOF >> "$PRIMARY_CONF_FILE"
-
-RewriteCond %{HTTP_HOST} ^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$
-RewriteRule ^(.*)$ - [F,L]
-EOF
-    set_directive "RewriteEngine" "On" "$PRIMARY_CONF_FILE" # Ensure it's On
+# 7.11 Ensure HTTP Strict Transport Security Is Enabled (Manual)
+print_status "7.11 Ensure HTTP Strict Transport Security Is Enabled"
+if grep -q "Header always set Strict-Transport-Security" "$APACHE_CONF"; then
+    print_status "HTTP Strict Transport Security is already enabled"
 else
-    log_info "mod_rewrite rule for IP Host check seems present in $PRIMARY_CONF_FILE."
+    print_status "Enabling HTTP Strict Transport Security"
+    echo "Header always set Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\"" >> "$APACHE_CONF"
+    a2enmod headers
 fi
 
-# 5.15 Specify Listen IPs (Level 2 - Check only)
-log_info "CIS 5.15: Ensure specific IP Addresses are used for Listen (Level 2 - Check only)"
-listen_any=$(get_config_files | xargs grep -Ei '^\s*Listen\s+(80|443|0\.0\.0\.0:|\[::\]:)')
-if [[ -n "$listen_any" ]]; then
-    log_warn "Found Listen directives that might bind to all interfaces. Review and specify IPs if needed:"
-    echo "$listen_any"
+# 7.12 Ensure Only Cipher Suites That Provide Forward Secrecy Are Enabled (Manual)
+print_status "7.12 Ensure Only Cipher Suites That Provide Forward Secrecy Are Enabled"
+if grep -q "SSLCipherSuite" "$APACHE_CONF"; then
+    print_status "SSL cipher suite is already configured"
 else
-    log_info "Listen directives appear to use specific IPs or non-standard ports (manual review still recommended)."
+    print_status "Configuring SSL cipher suite to only include cipher suites that provide forward secrecy"
+    echo "SSLCipherSuite ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256" >> "$APACHE_CONF"
 fi
 
-# 5.16 Restrict Browser Framing (Clickjacking) (Level 2 - Requires mod_headers)
-log_info "CIS 5.16: Restricting browser framing (Clickjacking) (Level 2 - Requires mod_headers)"
-manage_module "headers" "enable"
-# Using Content-Security-Policy is preferred
-set_directive "Header always set" "Content-Security-Policy \"frame-ancestors 'self'\"" "$PRIMARY_CONF_FILE"
-# Fallback: set_directive "Header always set" "X-Frame-Options SAMEORIGIN" "$PRIMARY_CONF_FILE"
+# 8. Information Leakage
+print_status "Section 8: Information Leakage"
 
-# 5.17 Set Referrer-Policy (Level 2/Manual - Requires mod_headers)
-log_info "CIS 5.17: Set HTTP Header Referrer-Policy appropriately (Level 2/Manual - Requires mod_headers)"
-manage_module "headers" "enable"
-log_warn "Setting Referrer-Policy to 'strict-origin-when-cross-origin'. Review if this policy is appropriate for your site."
-set_directive "Header always set" "Referrer-Policy \"strict-origin-when-cross-origin\"" "$PRIMARY_CONF_FILE"
-
-# 5.18 Set Permissions-Policy (Level 2/Manual - Requires mod_headers)
-log_info "CIS 5.18: Set HTTP Header Permissions-Policy appropriately (Level 2/Manual - Requires mod_headers)"
-manage_module "headers" "enable"
-log_warn "Setting a restrictive Permissions-Policy example. Review features needed by your site."
-set_directive "Header always set" "Permissions-Policy \"geolocation=(), microphone=(), camera=(), usb=()\"" "$PRIMARY_CONF_FILE"
-
-# --- Section 6: Operations - Logging, Monitoring, Maintenance ---
-log_info "CIS Section 6: Operations"
-
-# 6.1 Configure Error Log Filename and Severity Level
-log_info "CIS 6.1: Configuring ErrorLog filename and LogLevel"
-# Ensure ErrorLog is set (adjust path/syslog as needed)
-set_directive "ErrorLog" "logs/error_log" "$APACHE_CONF_FILE" # Or use $PRIMARY_CONF_FILE or syslog:local1 for 6.2
-set_directive "LogLevel" "notice core:info" "$PRIMARY_CONF_FILE"
-
-# 6.2 Configure Syslog Facility (Level 2)
-log_info "CIS 6.2: Configure Syslog Facility for Error Logging (Level 2)"
-log_warn "Consider changing ErrorLog to use syslog (e.g., 'ErrorLog syslog:local1'). Applying this now."
-set_directive "ErrorLog" "syslog:local1" "$APACHE_CONF_FILE" # Adjust facility if needed
-
-# 6.3 Configure Server Access Log
-log_info "CIS 6.3: Configuring Access Log (CustomLog)"
-# Define combined log format if not present
-backup_config "$PRIMARY_CONF_FILE"
-if ! grep -q 'LogFormat.*combined' "$PRIMARY_CONF_FILE"; then
-    log_info "Defining 'combined' LogFormat in $PRIMARY_CONF_FILE"
-    # Insert LogFormat definition near potential other LogFormat lines or globally
-     sed -i '/LogLevel/a LogFormat "%h %l %u %t \\"%r\\" %>s %b \\"%{Referer}i\\" \\"%{User-agent}i\\"" combined' "$PRIMARY_CONF_FILE"
-fi
-# Ensure CustomLog uses combined format (adjust path as needed)
-set_directive "CustomLog" "logs/access_log combined" "$APACHE_CONF_FILE" # Or $PRIMARY_CONF_FILE
-
-# 6.4 Log Storage/Rotation (Manual)
-log_info "CIS 6.4: Ensure Log Storage and Rotation (Manual)"
-log_warn "Configure log rotation (e.g., using logrotate or rotatelogs piped logging) to retain logs for >= 3 months and prevent disk exhaustion."
-
-# 6.5 Apply Patches (Manual)
-log_info "CIS 6.5: Ensure Applicable Patches Are Applied (Manual)"
-log_warn "Regularly update Apache and OS packages."
-
-# 6.6 ModSecurity Installed (Level 2 - Check only)
-log_info "CIS 6.6: Ensure ModSecurity Is Installed (Level 2 - Check only)"
-if apachectl -M 2>/dev/null | grep -q 'security2_module'; then
-    log_info "ModSecurity (security2_module) appears to be loaded."
+# 8.1 Ensure ServerTokens is Set to 'Prod' or 'ProductOnly' (Automated)
+print_status "8.1 Ensure ServerTokens is Set to 'Prod' or 'ProductOnly'"
+if grep -q "ServerTokens Prod" "$APACHE_CONF"; then
+    print_status "ServerTokens is already set to 'Prod'"
 else
-    log_warn "ModSecurity (security2_module) does not appear to be loaded. Install if required."
-fi
-
-# 6.7 OWASP ModSecurity CRS Enabled (Level 2 - Manual)
-log_info "CIS 6.7: Ensure OWASP ModSecurity Core Rule Set Is Installed/Enabled (Level 2 - Manual)"
-log_warn "Manual installation and tuning of OWASP CRS is required if using ModSecurity."
-
-# --- Section 7: SSL/TLS Configuration ---
-log_info "CIS Section 7: SSL/TLS Configuration (Requires mod_ssl)"
-
-# 7.1 Ensure mod_ssl installed/enabled
-log_info "CIS 7.1: Ensuring mod_ssl is enabled"
-manage_module "ssl" "enable"
-# Check if module is actually loaded after trying to enable
-if ! apachectl -M 2>/dev/null | grep -q 'ssl_module'; then
-    log_error "mod_ssl is required for TLS/SSL settings but could not be verified as loaded. Aborting TLS section."
-    # Exit or skip SSL section? Skipping for now.
-    SKIP_SSL=1
-else
-    SKIP_SSL=0
-fi
-
-if [[ "$SKIP_SSL" -eq 0 ]]; then
-    # Find primary SSL config file or add to default virtual host / primary conf
-    SSL_CONF_FILE=$(find "$APACHE_CONF_DIR" -type f -name "ssl.conf" -o -name "*-ssl.conf" -o -name "default-ssl.conf" | head -n 1)
-    if [[ -z "$SSL_CONF_FILE" ]]; then
-        log_warn "Could not find a dedicated SSL config file. Applying SSL settings to $PRIMARY_CONF_FILE. Consider using a dedicated file or VirtualHost."
-        SSL_CONF_FILE="$PRIMARY_CONF_FILE"
-    else
-         log_info "Applying SSL settings primarily to $SSL_CONF_FILE"
+    print_status "Setting ServerTokens to 'Prod'"
+    sed -i 's/#ServerTokens.*/ServerTokens Prod/' "$APACHE_CONF"
+    if ! grep -q "ServerTokens" "$APACHE_CONF"; then
+        echo "ServerTokens Prod" >> "$APACHE_CONF"
     fi
+fi
 
-    # 7.2 Valid Certificate (Manual)
-    log_info "CIS 7.2: Ensure Valid Trusted Certificate Installed (Manual)"
-    log_warn "Manually obtain and configure a valid, trusted TLS certificate (SSLCertificateFile, SSLCertificateKeyFile)."
-
-    # 7.3 Private Key Protection (Check only)
-    log_info "CIS 7.3: Ensure Private Key Is Protected (Check only)"
-    key_files=$(get_config_files | xargs grep -ih '^\s*SSLCertificateKeyFile' | awk '{print $2}' | sed 's/"//g')
-    if [[ -n "$key_files" ]]; then
-        log_info "Checking ownership and permissions for potential private key files:"
-        for kf in $key_files; do
-             if [[ -f "$kf" ]]; then
-                 ls -l "$kf"
-                 owner_group=$(stat -c "%U:%G" "$kf")
-                 perms=$(stat -c "%a" "$kf")
-                 if [[ "$owner_group" != "root:root" || "$perms" != "400" ]]; then
-                     log_warn "Key file $kf has incorrect ownership/permissions (Expected root:root 400). Run: chown root:root '$kf'; chmod 400 '$kf'"
-                 fi
-             else
-                 log_warn "Key file path not found: $kf"
-             fi
-        done
-    else
-        log_warn "Could not find SSLCertificateKeyFile directive to check."
+# 8.2 Ensure ServerSignature Is Not Enabled (Automated)
+print_status "8.2 Ensure ServerSignature Is Not Enabled"
+if grep -q "ServerSignature Off" "$APACHE_CONF"; then
+    print_status "ServerSignature is already set to 'Off'"
+else
+    print_status "Setting ServerSignature to 'Off'"
+    sed -i 's/#ServerSignature.*/ServerSignature Off/' "$APACHE_CONF"
+    if ! grep -q "ServerSignature" "$APACHE_CONF"; then
+        echo "ServerSignature Off" >> "$APACHE_CONF"
     fi
-
-    # 7.4 Disable TLSv1.0, TLSv1.1
-    log_info "CIS 7.4: Disabling TLSv1.0 and TLSv1.1"
-    set_directive "SSLProtocol" "all -SSLv3 -TLSv1 -TLSv1.1" "$SSL_CONF_FILE"
-
-    # 7.5, 7.8 Disable Weak/Medium Ciphers (Use combined strong suite)
-    log_info "CIS 7.5, 7.8: Disabling Weak and Medium strength ciphers"
-    # Example strong suite (Check compatibility with clients, OpenSSL version matters)
-    # This is a common strong suite favouring GCM and Forward Secrecy
-    CIPHER_SUITE="EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:!SHA1:!SHA256:!SHA384:!aNULL:!eNULL:!EXP:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA:!3DES:!IDEA"
-    set_directive "SSLCipherSuite" "\"${CIPHER_SUITE}\"" "$SSL_CONF_FILE" # Quote if using newer Apache
-    set_directive "SSLHonorCipherOrder" "on" "$SSL_CONF_FILE" # Check older Apache might use 'On'
-
-    # 7.6 Disable Insecure SSL Renegotiation
-    log_info "CIS 7.6: Ensuring Insecure SSL Renegotiation is disabled"
-    # Default is off, so only ensure it's not explicitly 'on'
-    comment_directive "SSLInsecureRenegotiation\s+on" "$SSL_CONF_FILE"
-    # Or explicitly set off: set_directive "SSLInsecureRenegotiation" "off" "$SSL_CONF_FILE"
-
-    # 7.7 Disable SSL Compression
-    log_info "CIS 7.7: Disabling SSL Compression"
-    set_directive "SSLCompression" "off" "$SSL_CONF_FILE" # Check older Apache might use 'Off'
-
-    # 7.9 All Content via HTTPS (Manual)
-    log_info "CIS 7.9: Ensure All Web Content Accessed via HTTPS (Manual)"
-    log_warn "Configure redirects from HTTP to HTTPS if needed (e.g., using mod_rewrite in HTTP vhost)."
-
-    # 7.10 Enable OCSP Stapling (Level 2)
-    log_info "CIS 7.10: Enabling OCSP Stapling (Level 2)"
-    set_directive "SSLUseStapling" "on" "$SSL_CONF_FILE" # Check older Apache might use 'On'
-    # Define cache (shmcb preferred if available)
-    set_directive "SSLStaplingCache" "\"shmcb:logs/ssl_stapling(32768)\"" "$SSL_CONF_FILE"
-
-    # 7.11 Enable HTTP Strict Transport Security (HSTS) (Level 2 - Requires mod_headers)
-    log_info "CIS 7.11: Enabling HSTS (Level 2 - Requires mod_headers)"
-    manage_module "headers" "enable"
-    # Start with a short max-age for testing (e.g., 300 seconds = 5 mins)
-    # Increase gradually to e.g., 31536000 (1 year) once confirmed working.
-    # Add 'includeSubDomains' carefully after verifying all subdomains support HTTPS.
-    log_warn "Setting HSTS max-age to 600 seconds (10 minutes). Increase after testing."
-    set_directive "Header always set" "Strict-Transport-Security \"max-age=600\"" "$SSL_CONF_FILE"
-
-    # 7.12 Ensure Forward Secrecy (Level 2)
-    log_info "CIS 7.12: Ensure Only Cipher Suites Providing Forward Secrecy (Level 2)"
-    log_info "This is covered by the SSLCipherSuite setting in 7.5/7.8 which prioritizes EECDH/EDH."
-
-fi # End SSL Skipped section
-
-# --- Section 8: Information Leakage ---
-log_info "CIS Section 8: Information Leakage"
-
-# 8.1 Set ServerTokens to Prod
-log_info "CIS 8.1: Setting ServerTokens to Prod"
-set_directive "ServerTokens" "Prod" "$PRIMARY_CONF_FILE"
-
-# 8.2 Set ServerSignature to Off
-log_info "CIS 8.2: Setting ServerSignature to Off"
-set_directive "ServerSignature" "Off" "$PRIMARY_CONF_FILE"
-
-# 8.3 Remove All Default Apache Content (Manual)
-log_info "CIS 8.3: Ensure All Default Apache Content Is Removed (Manual)"
-log_warn "Manually remove default welcome pages, icons, manuals, etc. (See also 5.4-5.6)"
-
-# 8.4 Configure ETag Header (Level 2)
-log_info "CIS 8.4: Configuring ETag response header (Level 2)"
-set_directive "FileETag" "MTime Size" "$PRIMARY_CONF_FILE"
-
-# --- Section 9: Denial of Service Mitigations ---
-log_info "CIS Section 9: Denial of Service Mitigations"
-
-# 9.1 Set TimeOut
-log_info "CIS 9.1: Setting Timeout to 10"
-set_directive "Timeout" "10" "$PRIMARY_CONF_FILE"
-
-# 9.2 Enable KeepAlive
-log_info "CIS 9.2: Enabling KeepAlive"
-set_directive "KeepAlive" "On" "$PRIMARY_CONF_FILE"
-
-# 9.3 Set MaxKeepAliveRequests
-log_info "CIS 9.3: Setting MaxKeepAliveRequests to 100"
-set_directive "MaxKeepAliveRequests" "100" "$PRIMARY_CONF_FILE"
-
-# 9.4 Set KeepAliveTimeout
-log_info "CIS 9.4: Setting KeepAliveTimeout to 15"
-set_directive "KeepAliveTimeout" "15" "$PRIMARY_CONF_FILE"
-
-# 9.5, 9.6 Set Timeout Limits for Request Headers/Body (Requires mod_reqtimeout)
-log_info "CIS 9.5, 9.6: Setting RequestReadTimeout (Requires mod_reqtimeout)"
-manage_module "reqtimeout" "enable"
-if apachectl -M 2>/dev/null | grep -q 'reqtimeout_module'; then
-    set_directive "RequestReadTimeout" "header=20-40,MinRate=500 body=20,MinRate=500" "$PRIMARY_CONF_FILE"
-else
-    log_warn "mod_reqtimeout not loaded. Cannot set RequestReadTimeout."
 fi
 
-# --- Section 10: Request Limits (Level 2) ---
-log_info "CIS Section 10: Request Limits (Level 2)"
+# 8.3 Ensure All Default Apache Content Is Removed (Manual)
+print_status "8.3 Ensure All Default Apache Content Is Removed"
+if [ -d "$WWW_DIR" ]; then
+    print_status "Removing default Apache content"
+    rm -rf "$WWW_DIR"/*
+else
+    print_status "Default Apache content is already removed"
+fi
 
-# 10.1 Set LimitRequestLine
-log_info "CIS 10.1: Setting LimitRequestLine to 8190 (Level 2)"
-set_directive "LimitRequestLine" "8190" "$PRIMARY_CONF_FILE"
+# 8.4 Ensure ETag Response Header Fields Do Not Include Inodes (Automated)
+print_status "8.4 Ensure ETag Response Header Fields Do Not Include Inodes"
+if grep -q "FileETag None" "$APACHE_CONF"; then
+    print_status "ETag response header fields are already configured to not include inodes"
+else
+    print_status "Configuring ETag response header fields to not include inodes"
+    echo "FileETag None" >> "$APACHE_CONF"
+fi
 
-# 10.2 Set LimitRequestFields
-log_info "CIS 10.2: Setting LimitRequestFields to 100 (Level 2)"
-set_directive "LimitRequestFields" "100" "$PRIMARY_CONF_FILE"
+# 9. Denial of Service Mitigations
+print_status "Section 9: Denial of Service Mitigations"
 
-# 10.3 Set LimitRequestFieldsize
-log_info "CIS 10.3: Setting LimitRequestFieldsize to 1024 (Level 2)"
-set_directive "LimitRequestFieldsize" "1024" "$PRIMARY_CONF_FILE"
-
-# 10.4 Set LimitRequestBody
-log_info "CIS 10.4: Setting LimitRequestBody to 102400 (100k) (Level 2)"
-log_warn "Setting LimitRequestBody to 100k. Test file uploads if used!"
-set_directive "LimitRequestBody" "102400" "$PRIMARY_CONF_FILE" # Apply globally, can override per-directory
-
-# --- Section 11: SELinux (Level 2 - RHEL specific, Check only/Manual) ---
-log_info "CIS Section 11: Enable SELinux (Level 2 - RHEL specific)"
-if [[ "$DISTRO" == "rhel" ]] && command -v sestatus > /dev/null; then
-    log_info "CIS 11.1: Checking SELinux enforcing mode"
-    sestatus | grep "Current mode"
-    sestatus | grep "Mode from config file"
-    if ! sestatus | grep -q "Current mode:\s*enforcing"; then log_warn "SELinux not currently enforcing. Run 'setenforce 1'."; fi
-    if ! grep -q 'SELINUX=enforcing' /etc/selinux/config; then log_warn "SELinux not set to enforcing in /etc/selinux/config."; fi
-
-    log_info "CIS 11.2: Checking Apache process context (Should be httpd_t)"
-    ps -eZ | grep "$APACHE_SERVICE" | head -n 5 # Show sample
-    if ! ps -eZ | grep "$APACHE_SERVICE" | grep -q ':httpd_t:'; then log_warn "Apache processes not running in httpd_t context."; fi
-
-    log_info "CIS 11.3: Checking if httpd_t type is permissive"
-    if command -v semanage > /dev/null; then
-        if semanage permissive -l | grep -q 'httpd_t'; then log_warn "httpd_t is in permissive mode. Run 'semanage permissive -d httpd_t'."; fi
-    else
-        log_warn "semanage command not found. Cannot check permissive types."
+# 9.1 Ensure the TimeOut Is Set to 10 or Less (Automated)
+print_status "9.1 Ensure the TimeOut Is Set to 10 or Less"
+if grep -q "TimeOut 10" "$APACHE_CONF"; then
+    print_status "TimeOut is already set to 10"
+else
+    print_status "Setting TimeOut to 10"
+    sed -i 's/TimeOut.*/TimeOut 10/' "$APACHE_CONF"
+    if ! grep -q "TimeOut" "$APACHE_CONF"; then
+        echo "TimeOut 10" >> "$APACHE_CONF"
     fi
-
-    log_info "CIS 11.4: Check Necessary SELinux Booleans (Manual)"
-    log_warn "Review SELinux booleans needed for Apache functionality (e.g., httpd_can_network_connect, httpd_enable_cgi) using 'getsebool -a | grep httpd'. Enable only required booleans with 'setsebool -P boolean_name on'."
-else
-    log_info "SELinux checks skipped (Not RHEL or sestatus not found)."
 fi
 
-# --- Section 12: AppArmor (Level 2 - Debian specific, Check only/Manual) ---
-log_info "CIS Section 12: Enable AppArmor (Level 2 - Debian/Ubuntu specific)"
-if [[ "$DISTRO" == "debian" ]] && command -v aa-status > /dev/null; then
-     log_info "CIS 12.1: Checking AppArmor status"
-     aa-status --enabled && log_info "AppArmor framework is enabled." || log_warn "AppArmor framework is NOT enabled."
-
-     log_info "CIS 12.2: Check Apache AppArmor Profile Configured Properly (Manual)"
-     log_warn "Review AppArmor profile for apache2 (e.g., /etc/apparmor.d/usr.sbin.apache2) for least privilege."
-
-     log_info "CIS 12.3: Checking Apache AppArmor profile mode"
-     aa-status | grep apache2
-     if ! aa-status | grep -q '/usr/sbin/apache2 (.*) enforce'; then log_warn "Apache AppArmor profile is not in enforce mode. Use 'aa-enforce /usr/sbin/apache2'."; fi
+# 9.2 Ensure KeepAlive Is Enabled (Automated)
+print_status "9.2 Ensure KeepAlive Is Enabled"
+if grep -q "KeepAlive On" "$APACHE_CONF"; then
+    print_status "KeepAlive is already enabled"
 else
-     log_info "AppArmor checks skipped (Not Debian/Ubuntu or aa-status not found)."
+    print_status "Enabling KeepAlive"
+    sed -i 's/#KeepAlive.*/KeepAlive On/' "$APACHE_CONF"
+    if ! grep -q "KeepAlive" "$APACHE_CONF"; then
+        echo "KeepAlive On" >> "$APACHE_CONF"
+    fi
 fi
 
+# 9.3 Ensure MaxKeepAliveRequests is Set to a Value of 100 or Greater (Automated)
+print_status "9.3 Ensure MaxKeepAliveRequests is Set to a Value of 100 or Greater"
+if grep -q "MaxKeepAliveRequests 100" "$APACHE_CONF"; then
+    print_status "MaxKeepAliveRequests is already set to 100"
+else
+    print_status "Setting MaxKeepAliveRequests to 100"
+    sed -i 's/MaxKeepAliveRequests.*/MaxKeepAliveRequests 100/' "$APACHE_CONF"
+    if ! grep -q "MaxKeepAliveRequests" "$APACHE_CONF"; then
+        echo "MaxKeepAliveRequests 100" >> "$APACHE_CONF"
+    fi
+fi
 
-# --- Completion ---
-log_info "----------------------------------------------------------------------"
-log_info "CIS Benchmark Hardening Script completed."
-log_info "Backups of modified files are in: $BACKUP_DIR"
-log_warn "Review all changes made, especially WARN and ERROR messages."
-log_warn "Test your Apache configuration using 'apachectl configtest' (Debian/Ubuntu) or 'httpd -t' (RHEL)."
-log_warn "Restart Apache for changes to take effect: 'systemctl restart $APACHE_SERVICE'"
-log_warn "Thoroughly test your website/application functionality after restarting."
-log_info "----------------------------------------------------------------------"
+# 9.4 Ensure KeepAliveTimeout is Set to a Value of 15 or Less (Automated)
+print_status "9.4 Ensure KeepAliveTimeout is Set to a Value of 15 or Less"
+if grep -q "KeepAliveTimeout 15" "$APACHE_CONF"; then
+    print_status "KeepAliveTimeout is already set to 15"
+else
+    print_status "Setting KeepAliveTimeout to 15"
+    sed -i 's/KeepAliveTimeout.*/KeepAliveTimeout 15/' "$APACHE_CONF"
+    if ! grep -q "KeepAliveTimeout" "$APACHE_CONF"; then
+        echo "KeepAliveTimeout 15" >> "$APACHE_CONF"
+    fi
+fi
 
-exit 0
+# 9.5 Ensure the Timeout Limits for Request Headers is Set to 40 or Less (Manual)
+print_status "9.5 Ensure the Timeout Limits for Request Headers is Set to 40 or Less"
+if grep -q "RequestReadTimeout" "$APACHE_CONF"; then
+    print_status "Request header timeout is already configured"
+else
+    print_status "Setting request header timeout to 40"
+    echo "RequestReadTimeout header=40-40,MinRate=500 body=10,MinRate=500" >> "$APACHE_CONF"
+    a2enmod reqtimeout
+fi
+
+# 9.6 Ensure Timeout Limits for the Request Body is Set to 20 or Less (Manual)
+print_status "9.6 Ensure Timeout Limits for the Request Body is Set to 20 or Less"
+if grep -q "RequestReadTimeout" "$APACHE_CONF"; then
+    print_status "Request body timeout is already configured"
+else
+    print_status "Setting request body timeout to 20"
+    echo "RequestReadTimeout header=40-40,MinRate=500 body=20,MinRate=500" >> "$APACHE_CONF"
+    a2enmod reqtimeout
+fi
+
+# 10. Request Limits
+print_status "Section 10: Request Limits"
+
+# 10.1 Ensure the LimitRequestLine directive is Set to 8190 or less but not 0 (Automated)
+print_status "10.1 Ensure the LimitRequestLine directive is Set to 8190 or less but not 0"
+if grep -q "LimitRequestLine 8190" "$APACHE_CONF"; then
+    print_status "LimitRequestLine is already set to 8190"
+else
+    print_status "Setting LimitRequestLine to 8190"
+    sed -i 's/LimitRequestLine.*/LimitRequestLine 8190/' "$APACHE_CONF"
+    if ! grep -q "LimitRequestLine" "$APACHE_CONF"; then
+        echo "LimitRequestLine 8190" >> "$APACHE_CONF"
+    fi
+fi
+
+# 10.2 Ensure the LimitRequestFields Directive is Set to 100 or Less but not 0 (Automated)
+print_status "10.2 Ensure the LimitRequestFields Directive is Set to 100 or Less but not 0"
+if grep -q "LimitRequestFields 100" "$APACHE_CONF"; then
+    print_status "LimitRequestFields is already set to 100"
+else
+    print_status "Setting LimitRequestFields to 100"
+    sed -i 's/LimitRequestFields.*/LimitRequestFields 100/' "$APACHE_CONF"
+    if ! grep -q "LimitRequestFields" "$APACHE_CONF"; then
+        echo "LimitRequestFields 100" >> "$APACHE_CONF"
+    fi
+fi
+
+# 10.3 Ensure the LimitRequestFieldsize Directive is Set to 8190 or Less (Automated)
+print_status "10.3 Ensure the LimitRequestFieldsize Directive is Set to 8190 or Less"
+if grep -q "LimitRequestFieldSize 8190" "$APACHE_CONF"; then
+    print_status "LimitRequestFieldSize is already set to 8190"
+else
+    print_status "Setting LimitRequestFieldSize to 8190"
+    sed -i 's/LimitRequestFieldSize.*/LimitRequestFieldSize 8190/' "$APACHE_CONF"
+    if ! grep -q "LimitRequestFieldSize" "$APACHE_CONF"; then
+        echo "LimitRequestFieldSize 8190" >> "$APACHE_CONF"
+    fi
+fi
+
+# 10.4 Ensure the LimitRequestBody Directive is Set to 102400 or Less but not 0 (Automated)
+print_status "10.4 Ensure the LimitRequestBody Directive is Set to 102400 or Less but not 0"
+if grep -q "LimitRequestBody 102400" "$APACHE_CONF"; then
+    print_status "LimitRequestBody is already set to 102400"
+else
+    print_status "Setting LimitRequestBody to 102400"
+    sed -i 's/LimitRequestBody.*/LimitRequestBody 102400/' "$APACHE_CONF"
+    if ! grep -q "LimitRequestBody" "$APACHE_CONF"; then
+        echo "LimitRequestBody 102400" >> "$APACHE_CONF"
+    fi
+fi
+
+# 11. Enable SELinux to Restrict Apache Processes
+print_status "Section 11: Enable SELinux to Restrict Apache Processes"
+
+# 11.1 Ensure SELinux Is Enabled in Enforcing Mode (Automated)
+print_status "11.1 Ensure SELinux Is Enabled in Enforcing Mode"
+if command -v getenforce &> /dev/null; then
+    if [ "$(getenforce)" = "Enforcing" ]; then
+        print_status "SELinux is already enabled in enforcing mode"
+    else
+        print_warning "SELinux is not enabled in enforcing mode"
+        print_warning "Manual step: Enable SELinux in enforcing mode"
+    fi
+else
+    print_status "SELinux is not installed on this system"
+fi
+
+# 11.2 Ensure Apache Processes Run in the httpd_t Confined Context (Manual)
+print_status "11.2 Ensure Apache Processes Run in the httpd_t Confined Context"
+if command -v ps &> /dev/null && command -v grep &> /dev/null; then
+    if ps -eZ | grep httpd_t; then
+        print_status "Apache processes are already running in the httpd_t confined context"
+    else
+        print_warning "Apache processes are not running in the httpd_t confined context"
+        print_warning "Manual step: Ensure Apache processes run in the httpd_t confined context"
+    fi
+else
+    print_status "Cannot check Apache process context"
+fi
+
+# 11.3 Ensure the httpd_t Type is Not in Permissive Mode (Automated)
+print_status "11.3 Ensure the httpd_t Type is Not in Permissive Mode"
+if command -v sestatus &> /dev/null; then
+    if sestatus | grep "httpd_t" | grep -q "permissive"; then
+        print_warning "httpd_t type is in permissive mode"
+        print_warning "Manual step: Ensure the httpd_t type is not in permissive mode"
+    else
+        print_status "httpd_t type is not in permissive mode"
+    fi
+else
+    print_status "Cannot check httpd_t type mode"
+fi
+
+# 11.4 Ensure Only the Necessary SELinux Booleans are Enabled (Manual)
+print_status "11.4 Ensure Only the Necessary SELinux Booleans are Enabled"
+if command -v getsebool &> /dev/null; then
+    print_status "Current SELinux booleans for Apache:"
+    getsebool -a | grep httpd
+    print_warning "Manual step: Review and disable unnecessary SELinux booleans for Apache"
+else
+    print_status "Cannot check SELinux booleans"
+fi
+
+# 12. Enable AppArmor to Restrict Apache Processes
+print_status "Section 12: Enable AppArmor to Restrict Apache Processes"
+
+# 12.1 Ensure the AppArmor Framework Is Enabled (Automated)
+print_status "12.1 Ensure the AppArmor Framework Is Enabled"
+if command -v aa-status &> /dev/null; then
+    if aa-status | grep -q "apparmor"; then
+        print_status "AppArmor framework is already enabled"
+    else
+        print_warning "AppArmor framework is not enabled"
+        print_warning "Manual step: Enable AppArmor framework"
+    fi
+else
+    print_status "AppArmor is not installed on this system"
+fi
+
+# 12.2 Ensure the Apache AppArmor Profile Is Configured Properly (Manual)
+print_status "12.2 Ensure the Apache AppArmor Profile Is Configured Properly"
+if [ -f "/etc/apparmor.d/usr.sbin.apache2" ]; then
+    print_status "Apache AppArmor profile is already configured"
+else
+    print_warning "Apache AppArmor profile is not configured"
+    print_warning "Manual step: Configure Apache AppArmor profile"
+fi
+
+# 12.3 Ensure Apache AppArmor Profile is in Enforce Mode (Automated)
+print_status "12.3 Ensure Apache AppArmor Profile is in Enforce Mode"
+if command -v aa-status &> /dev/null; then
+    if aa-status | grep "usr.sbin.apache2" | grep -q "enforce"; then
+        print_status "Apache AppArmor profile is already in enforce mode"
+    else
+        print_warning "Apache AppArmor profile is not in enforce mode"
+        print_warning "Manual step: Put Apache AppArmor profile in enforce mode"
+    fi
+else
+    print_status "Cannot check Apache AppArmor profile mode"
+fi
+
+# Allow Apache through UFW
+print_status "Allowing Apache through UFW"
+if command -v ufw &> /dev/null; then
+    ufw allow 'Apache Full'
+    print_status "Apache allowed through UFW"
+else
+    print_status "UFW is not installed or not in use"
+fi
+
+# Restart Apache service
+print_status "Restarting Apache service"
+systemctl restart apache2
+if systemctl is-active --quiet apache2; then
+    print_status "Apache service is running"
+else
+    print_error "Apache service failed to start"
+    print_error "Check the error logs: $LOG_DIR/error.log"
+fi
+
+print_status "CIS Apache HTTP Server 2.4 Benchmark configuration completed"
+print_status "Backup of original configuration files is available at: $BACKUP_DIR"
+print_status "Please review the manual steps and configurations to ensure they meet your specific requirements"

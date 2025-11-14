@@ -20,6 +20,7 @@ main(){
     configure_audit
     configure_fstab
     filePriviledges
+    auditBinaryIntegrity
     locateProhibitedFiles
     updateSystem
 }
@@ -112,6 +113,17 @@ configureSysctl() {
 configurePam() {
     echo "Configuring PAM for password complexity and account lock..."
 
+    echo "Removing insecure 'nullok' directives from PAM configuration files..."
+    mapfile -t pam_files_with_nullok < <(grep -rl "nullok" /etc/pam.d 2>/dev/null || true)
+    if (( ${#pam_files_with_nullok[@]} > 0 )); then
+        for pam_file in "${pam_files_with_nullok[@]}"; do
+            sudo sed -i 's/[[:space:]]*\<nullok\>//g' "$pam_file"
+            echo "Removed 'nullok' from $pam_file"
+        done
+    else
+        echo "No 'nullok' directives found in PAM configs."
+    fi
+
     # /etc/pam.d/common-auth: Configure account lockout policy
     if ! grep -q "pam_faillock.so" /etc/pam.d/common-auth; then
         echo "Adding faillock configuration to common-auth..."
@@ -142,15 +154,24 @@ configurePam() {
 
     # /etc/login.defs: Configure global password policies
     echo "Updating /etc/login.defs for password policies..."
-    sudo sed -i \
-        -e 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t14/' \
-        -e 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t7/' \
-        -e 's/^PASS_WARN_AGE.*/PASS_WARN_AGE\t7/' \
-        -e 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD\tSHA512/' \
-        -e 's/^FAILLOG_ENAB.*/FAILLOG_ENAB\tyes/' \
-        -e 's/^PASS_MAX_TRIES.*/PASS_MAX_TRIES\t3/' \
-        -e 's/^PASS_MIN_LEN.*/PASS_MIN_LEN\t12/' \
-        /etc/login.defs
+    local login_defs="/etc/login.defs"
+    declare -A login_def_updates=(
+        [PASS_MAX_DAYS]=30
+        [PASS_MIN_DAYS]=14
+        [PASS_WARN_AGE]=7
+        [ENCRYPT_METHOD]=SHA512
+        [FAILLOG_ENAB]=yes
+        [PASS_MAX_TRIES]=3
+        [PASS_MIN_LEN]=12
+    )
+
+    for key in "${!login_def_updates[@]}"; do
+        if grep -q "^${key}" "$login_defs"; then
+            sudo sed -i "s/^${key}.*/${key}\t${login_def_updates[$key]}/" "$login_defs"
+        else
+            echo -e "${key}\t${login_def_updates[$key]}" | sudo tee -a "$login_defs" >/dev/null
+        fi
+    done
 
     echo "PAM configuration completed successfully."
 }
@@ -310,43 +331,99 @@ updateSystem() {
 # Function to remove prohibited software and services
 removeProhibitedSoftware() {
     echo "Removing prohibited or unnecessary software..."
-    prohibited_software=(john* john-data *nmap* nmap-common ndiff vuze frostwire aircrack-ng airgraph-ng fcrackzip lcrack kismet freeciv minetest minetest-server *medusa* hydra* hydra-gtk truecrack ophcrack ophcrack-cli pdfcrack sipcrack irpas zeitgeist-core zeitgeist-datahub python-zeitgeist rhythmbox-plugin-zeitgeist zeitgeist nikto cryptcat nc netcat tightvncserver x11vnc nfs xinetd telnet rlogind rshd rsh* rcmd rexecd rbootd rquotad rstatd rusersd rwalld rexd fingerd tftpd snmp python-samba samba* sftpd vsftpd apache* apache2* ftp ssh php pop3 icmp sendmail dovecot bind9 nginx netcat-traditional netcat-openbsd ncat pnetcat socat sock socket sbd tcpdump lighttpd zenmap wireshark crack crack-common cyphesis aisleriot wesnoth wordpress gameconqueror qbittorrent qbittorrent-nox utorrent utserver metasploit-framework *deluge* ettercap* hashcat hashcat-data autopsy sqlmap postfix wifite wifiphisher spiderfoot ffuf tcpdump reaver impacket-scripts dnsrecon phpggc p0f ncrack masscan bloodhound cewl johnny eyewitness driftnet evilginx2 yersinia theharvester armitage veil polenum bettercap dirsearch dirbuster legion cutycapt rsh-redone-client gobuster havoc rsh-client vncviewer enum4linux dmitry snort* snort-common snort-common-libraries snort-doc snort-rules-default fwsnort *nessus* *macchanger* pixiewps bbqsql proxychains* whatweb dirb traceroute *httrack* *openvas* 4g8 acccheck bittorrent* bittornado* bluemon btscanner buildtorrent brutespray dsniff hunt nast netsniff-ng python-scapy sipgrep sniffit tcpick tcpreplay tcpslice tcptraceroute tcpxtract mdk3 slowhttptest ssldump sslstrip thc-ipv6 bro* darkstat dnstop flowscan nfstrace* streams ntopng* ostinato softflowd tshark wfuzz minetest* squid mahjongg* cheese*)
+
+    prohibited_software=(
+        4g8 42 acccheck adore adfind adm advancedipscanner advancedrun aircrack aircrack-ng airgraph-ng aide aidra aisleriot alaeda amap angryipscanner anydesk apache* apache2 apache2* armitage arches atera asyncrat autohotkey autopsy autofs backproxy badbunny bettercap bind9 binom bittorrent* bittornado* bliss bluemon boldmove bro* brundle brutespray bbqsql bukowski buildtorrent caveat cewl ccleaner cephei cheese cheese* cloudsnooper cobaltstrike coin connectwise crack crack-common cryptcat cutycapt cyphesis darkstat deluge deluge-gtk dmitry dirb dirbuster dirsearch discord dnstop dnsrecon driftnet dsniff ettercap ettercap* ettermap energymech enum4linux evilgnome evilginx2 ezuri effusion fcrackzip ffuf fingerd flowscan freeciv frostwire fwsnort gafgyt gameconqueror gkrellm gobuster goldeneye gonnacry havoc hashcat hashcat-data hasher handofthief heuristics hotrat hping httrack* hummingbad hydra* hydra-gtk icedid icecast icecast2 icefire icmp impacket-scripts iodine iodine_client iobitdriverbooster iobitunlocker john* john-data johnny jq kaiten keygen kismet kinsing kork kryptina lacrimae lazagne lcrack legion lightaidra lighttpd lilocked linuxdarlloz linuxencoder linuxlupper linuxlion linuxmillen linuxremaiten logkeys luabot macchanger* mahjongg* mallox manaplus masscan mayhem mdk3 medusa* megasync memcached metasploit-framework mighty minetest minetest* minetest-server mimikatz mirai mozi nast nc ncat ncrack ndiff nessus* netcat netcat-openbsd netcat-traditional netpass netsniff-ng newaidra ngrep nginx nikto nmap* nmap-common nfs nfstrace* nyadr-op nuxbee obsstudio odin openvas* ophcrack ophcrack-cli ostinato p0f pdqdeploy perfctl php phpggc pilot pigmygoat pixiewps pnscan podloso polenum pnetcat postfix processhacker proxychains* psexec pyrit pyxie qbittorrent qbittorrent-nox ramjet ramen ramenx ramenexx ramenex ramenexx ransomexx rclone reaver redis-cli redis-server regasm relx rexecd rexob rike rlogind rlogin rsh* rsh-client rsh-redone-client rshd rbootd rcmd rquotad rstatd rusersd rwalld rexd revouninstaller robotfindskitten rst samba* sendmail sbd scapy sharkdp sipcrack sipgrep slapper slubstick slowhttptest slurm smbmap snakso snmp snort* snort-common snort-common-libraries snort-doc snort-rules-default softflowd socat sock socket speakup sftpd sniffit ssh ssldump sslstrip staog streams sucrack suphp syslogk tcpdump tcpick tcpreplay tcpslice tcptraceroute tcpxtract teamviewer telnet theharvester thc-ipv6 tightvnc tightvncserver tftpd traceroute tsunami turla tshark tycoon unicornscan unworkable useradd utorrent utserver varnishd vatetloader veil vermilionstrike vit vncviewer vuze waterfall wesnoth wifite wifiphisher wireshark winux winter witvirus wordpress x11vnc xinetd xorddos xz-utils yersinia zeek zeitgeist zeitgeist-core zeitgeist-datahub zenmap zmap zipworm
+    )
+
     installed_software=($(dpkg -l | awk '{print $2}'))
 
     for software in "${installed_software[@]}"; do
-        if [[ " ${prohibited_software[@]} " =~ " ${software} " ]] && ! [[ " ${valid_software[@]} " =~ " ${software} " ]]; then
+        if [[ " ${prohibited_software[@]} " =~ " ${software} " ]] && \
+           ! [[ " ${valid_software[@]} " =~ " ${software} " ]]; then
             echo "Removing $software..."
-            sudo apt-get remove --purge -y "$software"
+            sudo apt remove --purge -y "$software"
         fi
     done
+
     sudo apt autoremove -y
     sudo apt autoclean -y
 }
 
+
 # Function to locate prohibited files in /home, including hidden files
 locateProhibitedFiles() {
-    echo "Locating prohibited files in /home directory..."
-    # Search for specific file types, including hidden files
-    prohibited_files=$(find / -type f \( \
-        -name "*.mp3" -o -name "*.txt" -o -name "*.wav" -o -name "*.wma" -o \
-        -name "*.aac" -o -name "*.mp4" -o -name "*.mov" -o -name "*.avi" -o \
-        -name "*.gif" -o -name "*.jpg" -o -name "*.png" -o -name "*.bmp" -o \
-        -name "*.img" -o -name "*.exe" -o -name "*.msi" -o -name "*.bat" -o \
-        -name "*.sh" -o -name ".*.mp3" -o -name ".*.txt" -o -name ".*.wav" -o \
-        -name ".*.wma" -o -name ".*.aac" -o -name ".*.mp4" -o -name ".*.mov" -o \
-        -name ".*.avi" -o -name ".*.gif" -o -name ".*.jpg" -o -name ".*.png" -o \
-        -name ".*.bmp" -o -name ".*.img" -o -name ".*.exe" -o -name ".*.msi" -o \
-        -name ".*.bat" -o -name ".*.sh" -o -name ".*.so" -o -name "*.php" -o \
-        -name ".*.php" -o -name "*.py" -o -name ".*.py" -o -name "*.so" -o \
-        -name ".*.so" \) 2>/dev/null)
-    
-    echo "$prohibited_files" >> /var/prohibited.txt
-    
-    if [ -n "$prohibited_files" ]; then
-        echo "Prohibited files found:"
-        echo "$prohibited_files"
+    echo "Scanning for prohibited or suspicious files..."
+
+    local log_file="/var/prohibited.txt"
+    : > "$log_file"
+
+    local -a search_roots=("/")
+    local -a exclude_paths=("/proc/*" "/sys/*" "/dev/*" "/run/*" "/var/lib/*" "/var/log/*" "/snap/*")
+
+    local -a media_ext=("*.mp3" "*.mp4" "*.m4a" "*.wav" "*.wma" "*.aac" "*.flac" "*.mov" "*.avi" "*.mkv")
+    local -a archive_exec_ext=("*.exe" "*.msi" "*.img" "*.iso" "*.bat" "*.cmd" "*.vbs" "*.scr")
+    local -a script_ext=("*.py" "*.pyc" "*.pyo" "*.php" "*.pl" "*.pm" "*.rb" "*.sh")
+    local -a doc_ext=("*.txt" "*.rtf" "*.doc" "*.docx" "*.xls" "*.xlsx" "*.ppt" "*.pptx")
+
+    local so_system_regex='^/(lib|lib64|usr/lib|usr/local/lib|var/lib|snap|boot|opt/(microsoft|google|vmware)|sbin|bin)'
+    local total_matches=0
+
+    scan_category() {
+        local category="$1"
+        shift
+        local -a patterns=("$@")
+        local -a matches=()
+
+        [[ ${#patterns[@]} -eq 0 ]] && return
+
+        for root in "${search_roots[@]}"; do
+            [[ -d "$root" ]] || continue
+
+            local -a pattern_expr=("(")
+            for idx in "${!patterns[@]}"; do
+                [[ $idx -gt 0 ]] && pattern_expr+=(-o)
+                pattern_expr+=(-iname "${patterns[$idx]}")
+            done
+            pattern_expr+=(")")
+
+            local -a find_args=("$root" -type f)
+            find_args+=("${pattern_expr[@]}")
+            for excl in "${exclude_paths[@]}"; do
+                find_args+=(-not -path "$excl")
+            done
+
+            while IFS= read -r file; do
+                [[ -z "$file" ]] && continue
+                if [[ "$category" == "Shared libraries" && "$file" =~ $so_system_regex ]]; then
+                    continue
+                fi
+                matches+=("$file")
+            done < <(find "${find_args[@]}" -print 2>/dev/null)
+        done
+
+        if (( ${#matches[@]} > 0 )); then
+            total_matches=$((total_matches + ${#matches[@]}))
+            {
+                echo "### $category"
+                for found in "${matches[@]}"; do
+                    printf 'File: %s (Name: %s)\n' "$found" "$(basename "$found")"
+                done
+                echo
+            } | tee -a "$log_file" >/dev/null
+        fi
+    }
+
+    scan_category "Media files (audio/video)" "${media_ext[@]}"
+    scan_category "Executable installers and disk images" "${archive_exec_ext[@]}"
+    scan_category "Scripts (Python/Perl/PHP/Shell)" "${script_ext[@]}"
+    scan_category "Documents/potential data leaks" "${doc_ext[@]}"
+    scan_category "Shared libraries" "*.so"
+
+    if (( total_matches == 0 )); then
+        echo "No prohibited files detected in monitored locations."
     else
-        echo "No prohibited files found in / directory."
+        echo "Detailed report saved to $log_file"
     fi
 }
 
@@ -365,6 +442,146 @@ setUserPasswords() {
 filePriviledges(){
     df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type d -perm -0002 2>/dev/null | xargs chmod a+t
     bash helperScripts/permissions.sh
+}
+
+auditBinaryIntegrity() {
+    echo "Auditing for poisoned binaries and misconfigured SUID/SGID bits..."
+
+    local integrity_log="/var/binary_integrity_report.txt"
+    local suid_log="/var/suid_audit_report.txt"
+    local perm_log="/var/permission_anomalies.txt"
+    : > "$integrity_log"
+    : > "$suid_log"
+    : > "$perm_log"
+
+    if ! command -v debsums &> /dev/null; then
+        echo "Installing debsums for binary verification..."
+        sudo apt-get update -y && sudo apt-get install -y debsums
+    fi
+
+    if command -v debsums &> /dev/null; then
+        echo "Running debsums integrity check (listing mismatches only)..."
+        debsums -s | tee -a "$integrity_log"
+    else
+        echo "debsums not available. Skipping checksum verification." | tee -a "$integrity_log"
+    fi
+
+    local -a critical_packages=("coreutils" "passwd" "sudo" "util-linux" "openssh-client" "openssh-server" "shadow" "login" "bash")
+    echo "Verifying critical package files via dpkg -V..." | tee -a "$integrity_log"
+    for pkg in "${critical_packages[@]}"; do
+        if dpkg -s "$pkg" &> /dev/null; then
+            dpkg -V "$pkg" >> "$integrity_log"
+        else
+            echo "Package $pkg not installed; skipping." >> "$integrity_log"
+        fi
+    done
+
+    declare -A suid_whitelist=(
+        ["/usr/bin/sudo"]=1
+        ["/bin/su"]=1
+        ["/usr/bin/passwd"]=1
+        ["/usr/bin/chsh"]=1
+        ["/usr/bin/chfn"]=1
+        ["/usr/bin/gpasswd"]=1
+        ["/usr/bin/newgrp"]=1
+        ["/usr/bin/pkexec"]=1
+    )
+
+    echo "Collecting SUID binaries (sudo find / -perm -4000 -type f)..." | tee -a "$suid_log"
+    mapfile -t suid_files < <(sudo find / -perm -4000 -type f 2>/dev/null || true)
+    echo "Collecting SGID binaries (sudo find / -perm -2000 -type f)..." | tee -a "$suid_log"
+    mapfile -t sgid_files < <(sudo find / -perm -2000 -type f 2>/dev/null || true)
+
+    local unexpected_count=0
+    local -a non_root_suid=()
+    local -a non_root_sgid=()
+
+    for file in "${suid_files[@]}"; do
+        [[ -e "$file" ]] || continue
+        local owner="$(stat -c %U "$file" 2>/dev/null || echo unknown)"
+        if [[ -z "${suid_whitelist[$file]}" ]]; then
+            unexpected_count=$((unexpected_count + 1))
+            ls -l "$file" >> "$suid_log"
+        fi
+        if [[ "$owner" != "root" ]]; then
+            non_root_suid+=("$file (owner: $owner)")
+        fi
+    done
+
+    if [[ $unexpected_count -eq 0 ]]; then
+        echo "No unexpected SUID binaries detected outside whitelist." | tee -a "$suid_log"
+    else
+        echo "$unexpected_count unexpected SUID binary(s) detected. Details saved to $suid_log" | tee -a "$suid_log"
+    fi
+
+    local -a sgid_records=()
+    for file in "${sgid_files[@]}"; do
+        [[ -e "$file" ]] || continue
+        local owner="$(stat -c %U "$file" 2>/dev/null || echo unknown)"
+        local group="$(stat -c %G "$file" 2>/dev/null || echo unknown)"
+        sgid_records+=("$(ls -l "$file" 2>/dev/null)")
+        if [[ "$owner" != "root" ]]; then
+            non_root_sgid+=("$file (owner: $owner:$group)")
+        fi
+    done
+
+    if (( ${#sgid_records[@]} > 0 )); then
+        printf '%s\n' "${sgid_records[@]}" >> "$suid_log"
+    else
+        echo "No SGID binaries discovered." >> "$suid_log"
+    fi
+
+    {
+        echo
+        echo "### Non-root owned SUID binaries"
+        if (( ${#non_root_suid[@]} > 0 )); then
+            printf '%s\n' "${non_root_suid[@]}"
+        else
+            echo "None detected."
+        fi
+        echo
+        echo "### Non-root owned SGID binaries"
+        if (( ${#non_root_sgid[@]} > 0 )); then
+            printf '%s\n' "${non_root_sgid[@]}"
+        else
+            echo "None detected."
+        fi
+    } >> "$suid_log"
+
+    echo "Scanning for world-writable directories without sticky bit..." | tee -a "$perm_log"
+    mapfile -t ww_dirs_no_sticky < <(sudo find / -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null || true)
+    if (( ${#ww_dirs_no_sticky[@]} > 0 )); then
+        printf '%s\n' "${ww_dirs_no_sticky[@]}" >> "$perm_log"
+    else
+        echo "No world-writable directories without sticky bit detected." >> "$perm_log"
+    fi
+
+    echo "Checking for writable files within PATH directories..." | tee -a "$perm_log"
+    IFS=':' read -ra path_dirs <<< "$PATH"
+    local -a writable_path_bins=()
+    for dir in "${path_dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r file; do
+            writable_path_bins+=("$file")
+        done < <(find "$dir" -maxdepth 1 -type f -perm -0002 -print 2>/dev/null)
+    done
+    if (( ${#writable_path_bins[@]} > 0 )); then
+        printf '%s\n' "${writable_path_bins[@]}" >> "$perm_log"
+    else
+        echo "No world-writable files detected within PATH directories." >> "$perm_log"
+    fi
+
+    echo "Looking for overly permissive scripts and binaries..." | tee -a "$perm_log"
+    mapfile -t permissive_scripts < <(sudo find / -xdev \( -name '*.sh' -o -name '*.py' -o -name '*.pl' -o -name '*.rb' -o -name '*.php' \) -perm -0002 2>/dev/null || true)
+    if (( ${#permissive_scripts[@]} > 0 )); then
+        printf '%s\n' "${permissive_scripts[@]}" >> "$perm_log"
+    else
+        echo "No overly permissive scripts detected." >> "$perm_log"
+    fi
+
+    echo "Binary integrity report: $integrity_log"
+    echo "SUID/SGID audit report: $suid_log"
+    echo "Permission anomaly report: $perm_log"
 }
 
 # Read the contents of the files into arrays

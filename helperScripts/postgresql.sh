@@ -18,7 +18,9 @@ POSTGRES_CONF_DIR="/etc/postgresql/$POSTGRES_VERSION/main"
 POSTGRES_HBA_CONF="$POSTGRES_CONF_DIR/pg_hba.conf"
 POSTGRES_CONF="$POSTGRES_CONF_DIR/postgresql.conf"
 POSTGRES_USER="postgres"
-POSTGRES_PASSWORD="Cyb3Rm0nk3y$"  # Password set as per requirement
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/password_utils.sh"
+POSTGRES_PASSWORD="$(generate_service_password)"
 
 # Function to install PostgreSQL
 install_postgresql() {
@@ -46,6 +48,7 @@ systemctl start postgresql
 # Set PostgreSQL superuser password
 echo "Setting PostgreSQL superuser password..."
 sudo -u $POSTGRES_USER psql -c "ALTER USER $POSTGRES_USER WITH PASSWORD '$POSTGRES_PASSWORD';"
+store_service_password "postgres_superuser" "$POSTGRES_PASSWORD"
 
 # Aggressive Hardening Steps
 
